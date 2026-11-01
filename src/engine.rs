@@ -1,12 +1,12 @@
 use chrono::{Datelike, Timelike};
 use crate::announce;
-use crate::audio::{crossfade_to, Player};
+use crate::audio::{crossfade_to_segment, Player};
 use crate::config::{beside_exe, AppConfig, PlaylistMode};
 use crate::dsp::{decode_dtmf, Agc};
 use crate::evt;
 use crate::fade::{probe_tail_rms, rescann_playlist_durations, should_overlap_with_detector};
 use crate::jingles::JingleBank;
-use crate::nowplaying::{append_playlog, write_now_playing};
+use crate::nowplaying::{append_playlog_full, write_now_playing};
 use crate::playlist::{ItemKind, Playlist, PlaylistItem};
 use crate::satellite::LineInCapture;
 use crate::scheduler::{
@@ -214,17 +214,27 @@ impl Engine {
         // auto-fade / end detector + sweepers over current track
         if self.playing && !self.player.is_empty() {
             let elapsed = self.player.elapsed().as_secs_f32();
+            let (overlap, fade_out) = self
+                .playlist
+                .current()
+                .map(|it| {
+                    (
+                        it.resolve_overlap(self.config.overlap_secs),
+                        it.resolve_fade_out(self.config.fade_secs),
+                    )
+                })
+                .unwrap_or((self.config.overlap_secs, self.config.fade_secs));
             if should_overlap_with_detector(
                 elapsed,
                 self.track_duration,
-                self.config.overlap_secs,
+                overlap,
                 self.config.auto_fade,
                 self.config.end_detector_level,
                 self.track_tail_rms,
             ) {
-                // overlap: advance early
+                // overlap: advance early (sink empties → advance_after_play starts next)
                 if self.config.fade_on_overlap {
-                    self.player.fade_stop(self.config.fade_secs);
+                    self.player.fade_stop(fade_out);
                 } else {
                     self.player.stop_immediate();
                 }
@@ -589,28 +599,100 @@ impl Engine {
         self.play_current_item()
     }
 
+    /// Retoma uma faixa a partir de um offset (segundos no arquivo), sem alterar
+    /// o cue_in persistido. Usado na recuperação de sessão.
+    pub fn play_playlist_index_at(&mut self, idx: usize, offset_secs: f32) -> anyhow::Result<()> {
+        if idx >= self.playlist.items.len() {
+            anyhow::bail!("índice fora da lista: {idx}");
+        }
+        self.playlist.cursor = idx;
+        self.playing = true;
+        let path = self.playlist.items[idx].path.clone();
+        let title = self.playlist.items[idx].label.clone();
+        let base_cue = self.playlist.items[idx].timing.cue_in.unwrap_or(0.0).max(0.0);
+        let cue = base_cue + offset_secs.max(0.0);
+        let take = self.playlist.items[idx].effective_duration().map(|d| {
+            (d - offset_secs.max(0.0)).max(0.0)
+        });
+        let fade_in = self.playlist.items[idx].resolve_fade_in();
+        self.player.stop_all("resume_at");
+        self.player
+            .play_file_segment(&path, "resume_at", cue, take, fade_in)?;
+        self.track_duration = take;
+        write_now_playing(&self.config.now_playing_file, &title, &path);
+        append_playlog_full(
+            &self.config.playlog_file,
+            &title,
+            &path,
+            take,
+            Some("resume"),
+        );
+        self.set_status(format!("Retomado: {title} (+{:.0}s)", offset_secs.max(0.0)));
+        Ok(())
+    }
+
     fn play_path(&mut self, path: &PathBuf, title: &str) -> anyhow::Result<()> {
         self.playing = true;
+        // Incoming timing from the row we are starting; outgoing fade from the
+        // track still on the mixer (may differ from the new cursor).
+        let fade_out_prev = self
+            .player
+            .current_path()
+            .and_then(|cur| {
+                self.playlist
+                    .items
+                    .iter()
+                    .find(|i| i.path == cur)
+                    .map(|i| i.resolve_fade_out(self.config.fade_secs))
+            })
+            .unwrap_or(self.config.fade_secs);
+        let (cue_in, take, fade_in, overlap_for_probe) = {
+            let it = self
+                .playlist
+                .items
+                .iter()
+                .find(|i| &i.path == path)
+                .or_else(|| self.playlist.current());
+            if let Some(it) = it {
+                let cue_in = it.timing.cue_in.unwrap_or(0.0).max(0.0);
+                let take = it.effective_duration();
+                let fade_in = it.resolve_fade_in();
+                let overlap = it.resolve_overlap(self.config.overlap_secs);
+                (cue_in, take, fade_in, overlap)
+            } else {
+                (0.0, None, 0.0, self.config.overlap_secs)
+            }
+        };
         let same = self.player.current_path().as_ref() == Some(path);
         if same || self.player.is_empty() || !self.config.fade_on_overlap {
             // Fresh start / same-track restart / fade disabled → exactly 1 voice.
             self.player.stop_all("play_path_cut");
-            self.player.play_file_tagged(path, "play_path")?;
+            self.player.play_file_segment(path, "play_path", cue_in, take, fade_in)?;
         } else {
-            crossfade_to(
+            crossfade_to_segment(
                 &self.player,
                 path,
                 true,
-                self.config.fade_secs,
+                fade_out_prev,
+                cue_in,
+                take,
+                fade_in,
             )?;
         }
         // Offline probe — decode only, never touches the mixer / voice count.
         let voices_before_probe = self.player.active_voices();
-        if let Some((dur, rms)) = probe_tail_rms(path, self.config.overlap_secs.max(1.0)) {
-            self.track_duration = Some(dur);
+        if let Some((dur, rms)) = probe_tail_rms(path, overlap_for_probe.max(1.0)) {
+            // Effective on-air duration prefers cue window when set.
+            self.track_duration = take.or(Some(dur));
             self.track_tail_rms = Some(rms);
+            // Keep listed duration as file length for the inspector.
+            if let Some(it) = self.playlist.items.get_mut(self.playlist.cursor) {
+                if it.path == *path && it.duration_secs.is_none() {
+                    it.duration_secs = Some(dur);
+                }
+            }
         } else {
-            self.track_duration = None;
+            self.track_duration = take;
             self.track_tail_rms = None;
         }
         debug_assert_eq!(
@@ -621,7 +703,13 @@ impl Engine {
         let _ = voices_before_probe;
         self.sweeper_fired_for = None;
         write_now_playing(&self.config.now_playing_file, title, path);
-        append_playlog(&self.config.playlog_file, title, path);
+        append_playlog_full(
+            &self.config.playlog_file,
+            title,
+            path,
+            self.track_duration,
+            Some("audio"),
+        );
         self.set_status(format!("No ar: {title}"));
         Ok(())
     }
@@ -912,6 +1000,7 @@ mod play_state_tests {
                 kind: ItemKind::Audio,
                 overlap_override: None,
                 duration_secs: None,
+                timing: Default::default(),
             },
             PlaylistItem {
                 path: j2,
@@ -919,6 +1008,7 @@ mod play_state_tests {
                 kind: ItemKind::Audio,
                 overlap_override: None,
                 duration_secs: None,
+                timing: Default::default(),
             },
         ];
         eng.playlist.cursor = 0;
@@ -969,6 +1059,25 @@ mod play_state_tests {
         eng.stop();
         assert!(!eng.playing);
         assert_eq!(eng.player.active_voices(), 0);
+    }
+
+    #[test]
+    fn play_with_cue_points_one_voice_no_double() {
+        let mut eng = load_two_track_engine();
+        eng.playlist.items[0].timing.cue_in = Some(0.05);
+        eng.playlist.items[0].timing.fade_in = Some(0.1);
+        eng.playlist.items[0].timing.fade_out = Some(0.2);
+        eng.playlist.items[0].overlap_override = Some(0.15);
+        eng.play_playlist_index(0).unwrap();
+        assert!(eng.playing);
+        assert_eq!(eng.player.active_voices(), 1);
+        // Double-fire same index stays at 1
+        eng.play_playlist_index(0).unwrap();
+        assert_eq!(eng.player.active_voices(), 1);
+        // Crossfade to next with per-track fade_out
+        eng.play_playlist_index(1).unwrap();
+        let v = eng.player.active_voices();
+        assert!(v >= 1 && v <= 2, "voices during crossfade {v}");
     }
 
     #[test]

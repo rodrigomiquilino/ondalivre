@@ -32,6 +32,32 @@ pub enum ItemKind {
     Unknown,
 }
 
+/// Metadados de cue/fade por faixa (persistidos como `#OLMETA:{json}` no .lst).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct TrackTiming {
+    /// Ponto de entrada (segundos a partir do início do arquivo).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cue_in: Option<f32>,
+    /// Ponto de saída (posição absoluta no arquivo). None = fim natural.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cue_out: Option<f32>,
+    /// Fade-in ao iniciar esta faixa (s). None = sem fade-in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fade_in: Option<f32>,
+    /// Fade-out / crossfade ao sair (s). None = usa o global da config.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fade_out: Option<f32>,
+}
+
+impl TrackTiming {
+    pub fn is_empty(&self) -> bool {
+        self.cue_in.is_none()
+            && self.cue_out.is_none()
+            && self.fade_in.is_none()
+            && self.fade_out.is_none()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlaylistItem {
     pub path: PathBuf,
@@ -39,6 +65,34 @@ pub struct PlaylistItem {
     pub label: String,
     pub overlap_override: Option<f32>,
     pub duration_secs: Option<f32>,
+    /// Cue in/out e fades por faixa.
+    #[serde(default)]
+    pub timing: TrackTiming,
+}
+
+impl PlaylistItem {
+    /// Duração efetiva no ar: (cue_out ou file_dur) - cue_in.
+    pub fn effective_duration(&self) -> Option<f32> {
+        let cue_in = self.timing.cue_in.unwrap_or(0.0).max(0.0);
+        let end = self
+            .timing
+            .cue_out
+            .or(self.duration_secs)
+            .map(|v| v.max(cue_in));
+        end.map(|e| (e - cue_in).max(0.0))
+    }
+
+    pub fn resolve_overlap(&self, global: f32) -> f32 {
+        self.overlap_override.unwrap_or(global).max(0.0)
+    }
+
+    pub fn resolve_fade_out(&self, global: f32) -> f32 {
+        self.timing.fade_out.unwrap_or(global).max(0.0)
+    }
+
+    pub fn resolve_fade_in(&self) -> f32 {
+        self.timing.fade_in.unwrap_or(0.0).max(0.0)
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -296,11 +350,37 @@ impl Playlist {
         let mut real = String::new();
         for it in &self.items {
             use std::fmt::Write as _;
+            if it.overlap_override.is_some() || !it.timing.is_empty() {
+                let meta = ItemMetaLine {
+                    overlap: it.overlap_override,
+                    cue_in: it.timing.cue_in,
+                    cue_out: it.timing.cue_out,
+                    fade_in: it.timing.fade_in,
+                    fade_out: it.timing.fade_out,
+                };
+                if let Ok(js) = serde_json::to_string(&meta) {
+                    let _ = writeln!(real, "#OLMETA:{js}");
+                }
+            }
             let _ = writeln!(real, "{}", it.path.display());
         }
         std::fs::write(path, real)?;
         Ok(())
     }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct ItemMetaLine {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    overlap: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cue_in: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cue_out: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    fade_in: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    fade_out: Option<f32>,
 }
 
 
@@ -427,6 +507,7 @@ pub fn classify_path(path: PathBuf) -> PlaylistItem {
         label,
         overlap_override,
         duration_secs: None,
+        timing: TrackTiming::default(),
     }
 }
 
@@ -461,14 +542,34 @@ pub fn parse_list_file(path: &Path) -> anyhow::Result<Vec<PlaylistItem>> {
         return Ok(items);
     }
 
+    let mut pending_meta: Option<ItemMetaLine> = None;
     for line in text.lines() {
         let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("#OLMETA:") {
+            pending_meta = serde_json::from_str(rest.trim()).ok();
+            continue;
+        }
+        if line.starts_with('#') {
             continue;
         }
         // m3u extended duration lines already skipped by #
         let entry = line.split(',').next().unwrap_or(line).trim();
+        let before = items.len();
         push_resolved(&mut items, base, entry);
+        if let Some(meta) = pending_meta.take() {
+            if let Some(it) = items.get_mut(before) {
+                if meta.overlap.is_some() {
+                    it.overlap_override = meta.overlap;
+                }
+                it.timing.cue_in = meta.cue_in.or(it.timing.cue_in);
+                it.timing.cue_out = meta.cue_out.or(it.timing.cue_out);
+                it.timing.fade_in = meta.fade_in.or(it.timing.fade_in);
+                it.timing.fade_out = meta.fade_out.or(it.timing.fade_out);
+            }
+        }
     }
     Ok(items)
 }
@@ -602,6 +703,62 @@ mod tests {
         }
         assert!(!is_audio(Path::new("f.txt")));
         assert!(!is_audio(Path::new("f.exe")));
+    }
+
+    #[test]
+    fn effective_duration_respects_cue_points() {
+        let mut it = classify_path(PathBuf::from("song.mp3"));
+        it.duration_secs = Some(200.0);
+        assert_eq!(it.effective_duration(), Some(200.0));
+        it.timing.cue_in = Some(10.0);
+        assert_eq!(it.effective_duration(), Some(190.0));
+        it.timing.cue_out = Some(50.0);
+        assert_eq!(it.effective_duration(), Some(40.0));
+        assert_eq!(it.resolve_fade_in(), 0.0);
+        it.timing.fade_in = Some(1.5);
+        assert!((it.resolve_fade_in() - 1.5).abs() < 0.01);
+        assert!((it.resolve_fade_out(2.0) - 2.0).abs() < 0.01);
+        it.timing.fade_out = Some(0.8);
+        assert!((it.resolve_fade_out(2.0) - 0.8).abs() < 0.01);
+        assert!((it.resolve_overlap(3.0) - 3.0).abs() < 0.01);
+        it.overlap_override = Some(1.2);
+        assert!((it.resolve_overlap(3.0) - 1.2).abs() < 0.01);
+    }
+
+    #[test]
+    fn olmeta_roundtrip_in_lst() {
+        let dir = tempfile_dir();
+        let a = dir.join("a.mp3");
+        std::fs::write(&a, b"x").unwrap();
+        let mut pl = Playlist::default();
+        pl.add_path(a.clone());
+        pl.items[0].timing.cue_in = Some(2.5);
+        pl.items[0].timing.cue_out = Some(90.0);
+        pl.items[0].timing.fade_in = Some(0.5);
+        pl.items[0].timing.fade_out = Some(1.25);
+        pl.items[0].overlap_override = Some(2.0);
+        let lst = dir.join("cued.lst");
+        pl.save_list_file(&lst).unwrap();
+        let text = std::fs::read_to_string(&lst).unwrap();
+        assert!(text.contains("#OLMETA:"), "meta comment missing: {text}");
+        assert!(text.contains("cue_in"), "{text}");
+        let mut pl2 = Playlist::default();
+        pl2.load_list_file(&lst).unwrap();
+        assert_eq!(pl2.items.len(), 1);
+        let it = &pl2.items[0];
+        assert!((it.timing.cue_in.unwrap() - 2.5).abs() < 0.01);
+        assert!((it.timing.cue_out.unwrap() - 90.0).abs() < 0.01);
+        assert!((it.timing.fade_in.unwrap() - 0.5).abs() < 0.01);
+        assert!((it.timing.fade_out.unwrap() - 1.25).abs() < 0.01);
+        assert!((it.overlap_override.unwrap() - 2.0).abs() < 0.01);
+        // Zara-compatible: plain path lines still parse without meta
+        let plain = dir.join("plain.lst");
+        std::fs::write(&plain, format!("{}
+", a.display())).unwrap();
+        let mut pl3 = Playlist::default();
+        pl3.load_list_file(&plain).unwrap();
+        assert!(pl3.items[0].timing.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
 }

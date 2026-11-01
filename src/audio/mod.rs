@@ -141,32 +141,85 @@ impl Player {
     }
 
     pub fn play_file_tagged(&self, path: &Path, source: &'static str) -> anyhow::Result<()> {
+        self.play_file_segment(path, source, 0.0, None, 0.0)
+    }
+
+    /// Toca um segmento: pula `cue_in_secs`, limita a `take_secs` (None = até o fim)
+    /// e aplica fade-in linear de `fade_in_secs` (0 = volume cheio na hora).
+    /// Sempre corta a voz primária anterior (sem double-start).
+    pub fn play_file_segment(
+        &self,
+        path: &Path,
+        source: &'static str,
+        cue_in_secs: f32,
+        take_secs: Option<f32>,
+        fade_in_secs: f32,
+    ) -> anyhow::Result<()> {
+        use rodio::Source;
         // Hard cut previous primary voice (idempotent restart = exactly 1 primary).
         self.stop_primary_immediate(source);
         *self.last_source_tag.lock() = Some(source);
-        eprintln!("[ondalivre:audio] start source={source} path={}", path.display());
+        eprintln!(
+            "[ondalivre:audio] start source={source} path={} cue_in={cue_in_secs:.2} take={take_secs:?} fade_in={fade_in_secs:.2}",
+            path.display()
+        );
 
         let file = File::open(path)?;
         let decoder = Decoder::new(BufReader::new(file))?;
+        let cue = cue_in_secs.max(0.0);
+        let take = take_secs.map(|t| t.max(0.05));
+        let fade_in = fade_in_secs.max(0.0);
+        let target_vol = *self.volume.lock();
+
         match &self.backend {
             OutputBackend::Live { handle, .. } => {
                 let sink = Sink::try_new(handle)?;
-                sink.set_volume(*self.volume.lock());
-                sink.append(decoder);
+                let start_vol = if fade_in > 0.02 { 0.0 } else { target_vol };
+                sink.set_volume(start_vol);
+                let src = decoder.skip_duration(Duration::from_secs_f32(cue));
+                if let Some(secs) = take {
+                    sink.append(src.take_duration(Duration::from_secs_f32(secs)));
+                } else {
+                    sink.append(src);
+                }
                 sink.play();
                 *self.sink.lock() = Some(sink);
                 self.voice_count.fetch_add(1, Ordering::Relaxed);
+                if fade_in > 0.02 {
+                    self.spawn_fade_in(fade_in, target_vol);
+                }
             }
             OutputBackend::Headless => {
                 drop(decoder);
                 *self.headless_active.lock() = true;
                 *self.headless_started.lock() = Some(Instant::now());
                 self.voice_count.store(1, Ordering::Relaxed);
+                let _ = (cue, take, fade_in, target_vol);
             }
         }
         *self.started.lock() = Some(Instant::now());
         *self.current_path.lock() = Some(path.to_path_buf());
         Ok(())
+    }
+
+    fn spawn_fade_in(&self, fade_secs: f32, target_vol: f32) {
+        let sink_arc = Arc::clone(&self.sink);
+        std::thread::spawn(move || {
+            let steps = 20;
+            let step = Duration::from_secs_f32((fade_secs.max(0.05)) / steps as f32);
+            for i in 1..=steps {
+                let factor = i as f32 / steps as f32;
+                if let Some(s) = sink_arc.lock().as_ref() {
+                    s.set_volume(target_vol * factor);
+                } else {
+                    break;
+                }
+                std::thread::sleep(step);
+            }
+            if let Some(s) = sink_arc.lock().as_ref() {
+                s.set_volume(target_vol);
+            }
+        });
     }
 
     fn stop_primary_immediate(&self, source: &'static str) {
@@ -346,14 +399,27 @@ pub fn crossfade_to(
     fade_previous: bool,
     fade_secs: f32,
 ) -> anyhow::Result<()> {
+    crossfade_to_segment(player, next, fade_previous, fade_secs, 0.0, None, 0.0)
+}
+
+/// Crossfade into a cued segment of `next`.
+pub fn crossfade_to_segment(
+    player: &Player,
+    next: &Path,
+    fade_previous: bool,
+    fade_out_secs: f32,
+    cue_in_secs: f32,
+    take_secs: Option<f32>,
+    fade_in_secs: f32,
+) -> anyhow::Result<()> {
     if fade_previous && !player.is_empty() {
-        player.fade_stop_tagged(fade_secs, "crossfade_to");
+        player.fade_stop_tagged(fade_out_secs, "crossfade_to");
         // Tiny yield so the new sink is distinct; do not sleep long on UI thread.
         std::thread::sleep(Duration::from_millis(5));
     } else {
         player.stop_all("crossfade_cut");
     }
-    player.play_file_tagged(next, "crossfade_to")
+    player.play_file_segment(next, "crossfade_to", cue_in_secs, take_secs, fade_in_secs)
 }
 
 /// Floor elapsed / ceil remaining so they sum to duration (within 1s).
@@ -449,5 +515,18 @@ mod tests {
         let (e, r) = format_playhead(1.9, Some(10.0));
         assert_eq!(e, 1.0);
         assert_eq!(r, Some(9.0)); // ceil(10-1.9)=ceil(8.1)=9; 1+9=10
+    }
+
+    #[test]
+    fn play_segment_cue_in_stays_one_voice() {
+        let p = Player::headless(None);
+        let path = fixture("jingle1.wav");
+        p.play_file_segment(&path, "seg", 0.05, Some(0.4), 0.1).unwrap();
+        assert_eq!(p.active_voices(), 1);
+        // Re-fire must not double
+        p.play_file_segment(&path, "seg2", 0.0, Some(0.3), 0.0).unwrap();
+        assert_eq!(p.active_voices(), 1);
+        p.stop_all("test");
+        assert_eq!(p.active_voices(), 0);
     }
 }
