@@ -136,7 +136,7 @@ pub struct SweeperDraft {
 
 impl OndaApp {
     pub fn new(engine: SharedEngine) -> Self {
-        Self {
+        let mut app = Self {
             engine,
             windows: Windows::default(),
             nav: NavPage::Studio,
@@ -173,7 +173,20 @@ impl OndaApp {
             session_offer: None,
             session_autosave: crate::session::AutosaveClock::default(),
             track_edit_idx: None,
+        };
+        // QA/evidence hooks (ignored when env unset).
+        if let Ok(p) = std::env::var("OL_LIB_DIR") {
+            app.lib_dir = Some(PathBuf::from(p));
+            app.refresh_library();
+            app.nav = NavPage::Library;
         }
+        if std::env::var("OL_SHOW_TRACK_PROPS").ok().as_deref() == Some("1") {
+            // Deferred in update once the playlist has rows (avoids empty-index paint).
+            app.track_edit_idx = Some(0);
+            app.selected = Some(0);
+            app.nav = NavPage::Studio;
+        }
+        app
     }
 
     fn dark_mode(&self, ctx: &egui::Context) -> bool {
@@ -206,6 +219,22 @@ impl eframe::App for OndaApp {
             self.icons = Some(IconSet::load(ctx));
         }
         self.maybe_load_session_offer();
+        if self.track_edit_idx.is_some()
+            && !self.windows.track_props
+            && std::env::var("OL_SHOW_TRACK_PROPS").ok().as_deref() == Some("1")
+        {
+            let n = self.engine.lock().playlist.items.len();
+            if n > 0 {
+                if let Some(i) = self.track_edit_idx {
+                    if i < n {
+                        self.windows.track_props = true;
+                    }
+                }
+            }
+        }
+        if std::env::var("OL_SHOW_OPTIONS").ok().as_deref() == Some("1") {
+            self.windows.options = true;
+        }
         let dark = self.dark_mode(ctx);
         let accent = self.accent();
         let theme_key = (dark, u32::from_be_bytes([accent.r(), accent.g(), accent.b(), 0]));
@@ -3877,6 +3906,7 @@ clip={:?}
         let mut open = self.windows.track_props;
         let idx = self.track_edit_idx.or(self.selected);
         let mut save_list = false;
+        let accent = self.accent(); // before any engine lock (parking_lot is not reentrant)
         egui::Window::new("Cue / fade da faixa")
             .open(&mut open)
             .default_width(420.0)
@@ -3906,14 +3936,25 @@ clip={:?}
                 let global_fade = eng.config.fade_secs;
                 let global_overlap = eng.config.overlap_secs;
                 let it = &mut eng.playlist.items[i];
-                let mut cue_in = it.timing.cue_in.unwrap_or(0.0);
-                let mut cue_out = it.timing.cue_out.unwrap_or(file_dur.unwrap_or(0.0));
-                let mut fade_in = it.timing.fade_in.unwrap_or(0.0);
-                let mut fade_out = it.timing.fade_out.unwrap_or(global_fade);
-                let mut overlap = it.overlap_override.unwrap_or(global_overlap);
-                let cue_out_max = file_dur.unwrap_or(cue_out.max(cue_in + 1.0)).max(cue_in + 1.0);
-                ui.add(egui::Slider::new(&mut cue_in, 0.0..=cue_out_max).text("Cue in"));
-                ui.add(egui::Slider::new(&mut cue_out, cue_in..=cue_out_max).text("Cue out"));
+                let mut cue_in = it.timing.cue_in.unwrap_or(0.0).max(0.0);
+                let mut cue_out = it
+                    .timing
+                    .cue_out
+                    .unwrap_or(file_dur.unwrap_or(cue_in + 30.0))
+                    .max(cue_in + 0.1);
+                let mut fade_in = it.timing.fade_in.unwrap_or(0.0).max(0.0);
+                let mut fade_out = it.timing.fade_out.unwrap_or(global_fade).max(0.0);
+                let mut overlap = it.overlap_override.unwrap_or(global_overlap).max(0.0);
+                let cue_out_max = file_dur
+                    .unwrap_or(cue_out.max(cue_in + 30.0))
+                    .max(cue_out)
+                    .max(cue_in + 1.0)
+                    .max(1.0);
+                // Ranges must be non-empty or egui Slider panics.
+                let cue_in_max = cue_out_max.max(0.1);
+                ui.add(egui::Slider::new(&mut cue_in, 0.0..=cue_in_max).text("Cue in"));
+                let cue_out_min = cue_in.min(cue_out_max - 0.05);
+                ui.add(egui::Slider::new(&mut cue_out, cue_out_min..=cue_out_max).text("Cue out"));
                 ui.add(egui::Slider::new(&mut fade_in, 0.0..=8.0).text("Fade in"));
                 ui.add(egui::Slider::new(&mut fade_out, 0.0..=8.0).text("Fade out / crossfade"));
                 ui.add(egui::Slider::new(&mut overlap, 0.0..=15.0).text("Overlap"));
@@ -3943,7 +3984,7 @@ clip={:?}
                     ui.label(
                         RichText::new(format!("No ar: {}", fmt_mmss(e)))
                             .font(typo::caption())
-                            .color(self.accent()),
+                            .color(accent),
                     );
                 }
             });
