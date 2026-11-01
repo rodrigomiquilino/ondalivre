@@ -80,6 +80,9 @@ pub struct AppConfig {
     /// Intervalo em horas entre re-checks em background (ETag). Padrao 6.
     #[serde(default = "default_update_hours")]
     pub update_check_hours: f64,
+    /// Barra de menu clássica (Arquivo / Editar / …) no topo.
+    #[serde(default)]
+    pub show_classic_menu: bool,
 }
 
 fn default_sat_gain() -> f32 { 0.8 }
@@ -148,6 +151,7 @@ impl Default for AppConfig {
             humidity_folder: None,
             check_updates: true,
             update_check_hours: 6.0,
+            show_classic_menu: false,
         }
     }
 }
