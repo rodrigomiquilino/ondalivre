@@ -13,6 +13,7 @@ pub mod password;
 pub mod playlist;
 pub mod satellite;
 pub mod scheduler;
+pub mod session;
 pub mod stream;
 pub mod sweepers;
 pub mod tth;
