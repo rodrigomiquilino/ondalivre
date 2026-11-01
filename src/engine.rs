@@ -64,6 +64,10 @@ pub struct Engine {
     pub jingle_duration: Option<f32>,
     /// Fila de clips de anuncio (hora/TTH) no canal de jingle.
     pub announce_queue: std::collections::VecDeque<PathBuf>,
+    /// Slot assíncrono do TTS nativo Windows (WAV pronto ou erro). Nunca bloqueia a UI.
+    pub sapi_slot: announce::SapiSlot,
+    /// true enquanto um worker TTS está em andamento (evita spawns duplicados).
+    pub sapi_busy: bool,
 }
 
 impl Engine {
@@ -135,6 +139,8 @@ impl Engine {
             active_jingle: None,
             jingle_duration: None,
             announce_queue: std::collections::VecDeque::new(),
+            sapi_slot: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            sapi_busy: false,
         })
     }
 
@@ -162,9 +168,9 @@ impl Engine {
     pub fn stop(&mut self) {
         self.playing = false;
         if self.config.fade_on_stop {
-            self.player.fade_stop(self.config.fade_secs);
+            self.player.fade_stop_tagged(self.config.fade_secs, "engine_stop");
         } else {
-            self.player.stop_immediate();
+            self.player.stop_all("engine_stop");
         }
         self.set_status("Parado");
     }
@@ -275,6 +281,29 @@ impl Engine {
             if Instant::now() >= until {
                 self.stop_satellite();
                 self.set_status("Satélite OFF (tempo esgotado)");
+            }
+        }
+
+        // TTS nativo assíncrono → canal de jingle (volume/fade/device iguais a um clip).
+        if self.sapi_busy {
+            let ready = self
+                .sapi_slot
+                .lock()
+                .ok()
+                .and_then(|mut g| g.take());
+            if let Some(result) = ready {
+                self.sapi_busy = false;
+                match result {
+                    Ok(path) => {
+                        self.announce_queue.push_back(path);
+                        self.set_status("Anunciando hora...");
+                    }
+                    Err(e) => {
+                        self.set_status(format!(
+                            "TTS falhou: {e}. Configure a pasta Time/ em Configurações > Hora certa."
+                        ));
+                    }
+                }
             }
         }
 
@@ -548,13 +577,35 @@ impl Engine {
         }
     }
 
+    /// Play playlist row `idx` on the main channel (same path as command-bar Play
+    /// after selecting the row). Idempotent: sets `playing`, hard-restarts if the
+    /// same path is already current so onset is never doubled.
+    pub fn play_playlist_index(&mut self, idx: usize) -> anyhow::Result<()> {
+        if idx >= self.playlist.items.len() {
+            anyhow::bail!("índice fora da lista: {idx}");
+        }
+        self.playlist.cursor = idx;
+        self.playing = true;
+        self.play_current_item()
+    }
+
     fn play_path(&mut self, path: &PathBuf, title: &str) -> anyhow::Result<()> {
-        crossfade_to(
-            &self.player,
-            path,
-            self.config.fade_on_overlap,
-            self.config.fade_secs,
-        )?;
+        self.playing = true;
+        let same = self.player.current_path().as_ref() == Some(path);
+        if same || self.player.is_empty() || !self.config.fade_on_overlap {
+            // Fresh start / same-track restart / fade disabled → exactly 1 voice.
+            self.player.stop_all("play_path_cut");
+            self.player.play_file_tagged(path, "play_path")?;
+        } else {
+            crossfade_to(
+                &self.player,
+                path,
+                true,
+                self.config.fade_secs,
+            )?;
+        }
+        // Offline probe — decode only, never touches the mixer / voice count.
+        let voices_before_probe = self.player.active_voices();
         if let Some((dur, rms)) = probe_tail_rms(path, self.config.overlap_secs.max(1.0)) {
             self.track_duration = Some(dur);
             self.track_tail_rms = Some(rms);
@@ -562,6 +613,12 @@ impl Engine {
             self.track_duration = None;
             self.track_tail_rms = None;
         }
+        debug_assert_eq!(
+            self.player.active_voices(),
+            voices_before_probe,
+            "duration probe must not add mixer voices"
+        );
+        let _ = voices_before_probe;
         self.sweeper_fired_for = None;
         write_now_playing(&self.config.now_playing_file, title, path);
         append_playlog(&self.config.playlog_file, title, path);
@@ -784,6 +841,7 @@ impl Engine {
         (self.playing && !self.player.is_empty())
             || !self.jingle_player.is_empty()
             || !self.announce_queue.is_empty()
+            || self.sapi_busy
     }
 
     pub fn snapshot_restart_state(&self) -> crate::update::RestartState {
@@ -801,24 +859,135 @@ impl Engine {
                 self.announce_queue = clips.into();
                 if let Some(first) = self.announce_queue.pop_front() {
                     match self.jingle_player.play_file(&first) {
-                        Ok(()) => self.set_status("Anunciando hora"),
+                        Ok(()) => self.set_status("Anunciando hora..."),
                         Err(e) => self.set_status(format!("Erro ao anunciar hora: {e}")),
                     }
                 }
             }
             Ok(_) => self.set_status("Nenhum clip de hora encontrado"),
             Err(e) => {
-                match announce::speak_time_sapi_ptbr() {
-                    Ok(()) => self.set_status(format!(
-                        "Hora anunciada por voz (SAPI). Para clips: Configurações > Hora certa. ({e})"
-                    )),
-                    Err(_) => self.set_status(format!(
-                        "{e}. Configure a pasta Time/ em Configurações > Hora certa (ao lado do .exe ou escolha via dialogo)."
-                    )),
+                // Sem clips: TTS nativo em worker (nunca PowerShell, nunca na UI thread).
+                if self.sapi_busy {
+                    self.set_status("Anunciando hora...");
+                    return;
                 }
+                if !announce::native_tts_available() {
+                    self.set_status(format!(
+                        "{e}. Configure a pasta Time/ em Configurações > Hora certa (ao lado do .exe ou escolha via dialogo)."
+                    ));
+                    return;
+                }
+                if let Ok(mut g) = self.sapi_slot.lock() {
+                    *g = None;
+                }
+                self.sapi_busy = true;
+                self.set_status("Anunciando hora...");
+                announce::spawn_synthesize_time_to_slot(std::sync::Arc::clone(&self.sapi_slot));
+                let _ = e; // motivo dos clips fica no log se necessário
             }
         }
     }
 }
 
 pub type SharedEngine = Arc<Mutex<Engine>>;
+
+
+#[cfg(test)]
+mod play_state_tests {
+    use super::*;
+    use crate::playlist::{ItemKind, PlaylistItem};
+    use std::path::PathBuf;
+    use std::time::{Duration, Instant};
+
+    fn load_two_track_engine() -> Engine {
+        let mut eng = Engine::new().expect("engine");
+        eng.config.fade_on_overlap = true;
+        eng.config.fade_on_stop = false;
+        let j1 = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata/jingles/jingle1.wav");
+        let j2 = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata/jingles/jingle2.wav");
+        eng.playlist.items = vec![
+            PlaylistItem {
+                path: j1,
+                label: "Track A".into(),
+                kind: ItemKind::Audio,
+                overlap_override: None,
+                duration_secs: None,
+            },
+            PlaylistItem {
+                path: j2,
+                label: "Track B".into(),
+                kind: ItemKind::Audio,
+                overlap_override: None,
+                duration_secs: None,
+            },
+        ];
+        eng.playlist.cursor = 0;
+        eng
+    }
+
+    #[test]
+    fn play_playlist_index_sets_playing_one_voice() {
+        let mut eng = load_two_track_engine();
+        eng.play_playlist_index(0).unwrap();
+        assert!(eng.playing, "playing flag must be true");
+        assert!(!eng.player.is_empty());
+        assert_eq!(eng.player.active_voices(), 1);
+        assert!(eng.status.message.contains("No ar"));
+        // Restart same index → still 1 voice
+        eng.play_playlist_index(0).unwrap();
+        assert_eq!(eng.player.active_voices(), 1);
+        assert!(eng.playing);
+    }
+
+    #[test]
+    fn position_advances_while_playing() {
+        let mut eng = load_two_track_engine();
+        eng.play_playlist_index(0).unwrap();
+        let a = eng.player.elapsed();
+        std::thread::sleep(Duration::from_millis(80));
+        let b = eng.player.elapsed();
+        assert!(b >= a, "position must be monotonic ({a:?} → {b:?})");
+        // Headless Instant clock should advance
+        if eng.player.is_headless() {
+            assert!(b > a, "headless playhead should advance");
+        }
+    }
+
+    #[test]
+    fn probe_does_not_add_voices() {
+        let eng = load_two_track_engine();
+        let path = eng.playlist.items[0].path.clone();
+        let before = eng.player.active_voices();
+        let _ = crate::fade::probe_duration_secs(&path);
+        assert_eq!(eng.player.active_voices(), before);
+    }
+
+    #[test]
+    fn stop_clears_playing_and_voices() {
+        let mut eng = load_two_track_engine();
+        eng.play_playlist_index(0).unwrap();
+        eng.stop();
+        assert!(!eng.playing);
+        assert_eq!(eng.player.active_voices(), 0);
+    }
+
+    #[test]
+    fn announce_time_tts_path_returns_immediately() {
+        let mut eng = Engine::new().expect("engine");
+        eng.config.time_folder = Some("/nonexistent/ondalivre-time-xyz-async".into());
+        let start = Instant::now();
+        eng.announce_time();
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(250),
+            "announce_time must not block on TTS, took {elapsed:?}"
+        );
+        let msg = eng.status.message.clone();
+        assert!(
+            msg.contains("Anunciando") || msg.contains("Time") || msg.contains("Configure"),
+            "unexpected status: {msg}"
+        );
+        #[cfg(windows)]
+        assert!(eng.sapi_busy, "Windows TTS worker should be marked busy");
+    }
+}

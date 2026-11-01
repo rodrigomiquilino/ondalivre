@@ -1,7 +1,10 @@
 use crate::config::{data_dir_for, AppConfig};
 use chrono::Timelike;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::sync::{Arc, Mutex};
+
+#[cfg(windows)]
+mod sapi_win;
 
 pub fn time_clips_now() -> anyhow::Result<Vec<PathBuf>> {
     time_clips_for(&AppConfig::default())
@@ -75,57 +78,53 @@ pub fn time_phrase_ptbr() -> String {
     }
 }
 
-/// Windows SAPI via PowerShell (pt-BR se instalado). No-op / Err fora do Windows.
-pub fn speak_time_sapi_ptbr() -> anyhow::Result<()> {
+/// Resultado assíncrono do TTS nativo (caminho WAV ou erro).
+pub type SapiSlot = Arc<Mutex<Option<Result<PathBuf, String>>>>;
+
+/// Dispara síntese nativa Windows em thread dedicada (COM/WinRT nessa thread).
+/// Retorna imediatamente. O resultado aparece em `slot` (Ok = WAV temp para tocar
+/// no canal de jingle; Err = mensagem). Fora do Windows, preenche Err na hora.
+pub fn spawn_synthesize_time_to_slot(slot: SapiSlot) {
     let phrase = time_phrase_ptbr();
-    speak_sapi_ptbr(&phrase)
+    spawn_synthesize_phrase_to_slot(phrase, slot);
 }
 
-pub fn speak_sapi_ptbr(phrase: &str) -> anyhow::Result<()> {
+pub fn spawn_synthesize_phrase_to_slot(phrase: String, slot: SapiSlot) {
     #[cfg(windows)]
     {
-        // Escape for PowerShell single-quoted string.
-        let safe = phrase.replace('\'', "''");
-        let script = format!(
-            "Add-Type -AssemblyName System.Speech; \
-             $s = New-Object System.Speech.Synthesis.SpeechSynthesizer; \
-             try {{ $s.SelectVoiceByHints([System.Speech.Synthesis.VoiceGender]::NotSet, \
-               [System.Speech.Synthesis.VoiceAge]::NotSet, 0, \
-               [System.Globalization.CultureInfo]::GetCultureInfo('pt-BR')); }} catch {{}}; \
-             $s.Speak('{safe}');"
-        );
-        let status = Command::new("powershell")
-            .args(["-NoProfile", "-Command", &script])
-            .status()?;
-        if !status.success() {
-            anyhow::bail!("SAPI/PowerShell falhou");
-        }
-        return Ok(());
+        std::thread::Builder::new()
+            .name("ondalivre-sapi".into())
+            .spawn(move || {
+                let result = sapi_win::synthesize_phrase_to_wav_file(&phrase)
+                    .map_err(|e| e.to_string());
+                if let Ok(mut g) = slot.lock() {
+                    *g = Some(result);
+                }
+            })
+            .expect("spawn sapi worker");
+        return;
     }
     #[cfg(not(windows))]
     {
         let _ = phrase;
-        // Wine may have powershell.exe — try it; otherwise Err.
-        let safe = phrase.replace('\'', "''");
-        let script = format!(
-            "Add-Type -AssemblyName System.Speech; \
-             $s = New-Object System.Speech.Synthesis.SpeechSynthesizer; \
-             $s.Speak('{safe}');"
-        );
-        match Command::new("powershell.exe")
-            .args(["-NoProfile", "-Command", &script])
-            .status()
-        {
-            Ok(st) if st.success() => Ok(()),
-            _ => anyhow::bail!("TTS Windows SAPI indisponível neste sistema"),
+        if let Ok(mut g) = slot.lock() {
+            *g = Some(Err(
+                "TTS Windows SAPI/WinRT indisponível neste sistema".into(),
+            ));
         }
     }
+}
+
+/// True se este build inclui o sintetizador nativo Windows (sem PowerShell).
+pub fn native_tts_available() -> bool {
+    cfg!(windows)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::AppConfig;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn phrase_non_empty() {
@@ -138,7 +137,7 @@ mod tests {
         let _ = std::fs::create_dir_all(&tmp);
         let prev = std::env::current_dir().unwrap();
         std::env::set_current_dir(&tmp).unwrap();
-        let cfg = AppConfig::default(); // no override → beside_exe or cwd; neither has Time/
+        let cfg = AppConfig::default();
         let err = time_clips_for(&cfg).unwrap_err().to_string();
         std::env::set_current_dir(prev).unwrap();
         let _ = std::fs::remove_dir_all(&tmp);
@@ -154,5 +153,37 @@ mod tests {
         cfg.time_folder = Some("/nonexistent/ondalivre-time-xyz".into());
         let err = time_clips_for(&cfg).unwrap_err().to_string();
         assert!(err.contains("Time") || err.contains("pasta"), "{err}");
+    }
+
+    /// Anunciar hora (caminho TTS) deve retornar imediatamente — não bloquear a UI.
+    #[test]
+    fn announce_tts_spawn_returns_immediately() {
+        let slot: SapiSlot = Arc::new(Mutex::new(None));
+        let start = Instant::now();
+        spawn_synthesize_time_to_slot(Arc::clone(&slot));
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(200),
+            "spawn must return immediately, took {elapsed:?}"
+        );
+        // On non-Windows the slot is filled synchronously with Err.
+        #[cfg(not(windows))]
+        {
+            let g = slot.lock().unwrap();
+            assert!(matches!(*g, Some(Err(_))));
+        }
+        // On Windows, give the worker a brief moment then ensure slot eventually settles
+        // (CI has a separate synthesize_buffer_nonempty test).
+        #[cfg(windows)]
+        {
+            for _ in 0..200 {
+                if slot.lock().unwrap().is_some() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            let g = slot.lock().unwrap();
+            assert!(g.is_some(), "worker should finish within ~5s on CI");
+        }
     }
 }

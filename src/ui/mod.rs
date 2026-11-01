@@ -205,12 +205,18 @@ impl eframe::App for OndaApp {
         }
         self.poll_updates(ctx);
         let dt = ctx.input(|i| i.stable_dt).min(0.05);
-        let (playing, satellite_live, jingle_live) = {
+        let (playing, air_live, satellite_live, jingle_live, sapi_busy) = {
             let mut eng = self.engine.lock();
             eng.tick();
+            // Heal orphan audio: sink alive but flag false (legacy double-click path).
+            if !eng.playing && !eng.player.is_empty() {
+                eng.playing = true;
+            }
             let playing = eng.playing && !eng.player.is_empty();
+            let air_live = playing || !eng.player.is_empty();
             let jingle_live = eng.jingle_is_playing();
             let satellite_live = eng.satellite_live;
+            let sapi_busy = eng.sapi_busy;
             let msg = eng.status.message.to_ascii_lowercase();
             let alert = ["senha", "erro", "incorreta", "descartado", "expirou", "falha", "ignorado", "soltos", "import",
                 "configura", "pasta", "hora", "anunci", "atualiz", "sapi", "clip", "download", "sha"]
@@ -224,25 +230,34 @@ impl eframe::App for OndaApp {
             if eng.postit.is_some() {
                 self.windows.postit = true;
             }
-            (playing, satellite_live, jingle_live)
+            (playing, air_live, satellite_live, jingle_live, sapi_busy)
         };
-        let animating = playing || satellite_live || jingle_live || self.toast_alpha > 0.01;
+        let animating =
+            air_live || satellite_live || jingle_live || sapi_busy || self.toast_alpha > 0.01;
         if animating {
             self.anim = (self.anim + dt * 1.8) % 1000.0;
             let target = if playing {
                 0.35 + 0.55 * ((self.anim * 2.7).sin().abs())
             } else if satellite_live {
                 0.2 + 0.3 * ((self.anim * 1.9).sin().abs())
+            } else if jingle_live {
+                0.15 + 0.25 * ((self.anim * 3.1).sin().abs())
             } else {
                 0.05
             };
-            self.vu += (target - self.vu) * (dt * 10.0).clamp(0.0, 1.0);
-            // ~15 FPS enquanto toca / anima VU
-            ctx.request_repaint_after(std::time::Duration::from_millis(66));
+            // VU smoothed attack/release
+            let coeff = if target > self.vu { dt * 14.0 } else { dt * 6.0 };
+            self.vu += (target - self.vu) * coeff.clamp(0.0, 1.0);
+            // ~30–45 FPS while any channel is active (progress/VU/countdown smooth)
+            ctx.request_repaint_after(std::time::Duration::from_millis(22));
         } else {
-            // Idle: VU congelado; repaint só p/ relógio (Wine ainda pode bombear eventos)
             self.vu = 0.05;
-            ctx.request_repaint_after(std::time::Duration::from_secs(1));
+            // Idle: align next paint to the next wall-clock second boundary.
+            let now = chrono::Local::now();
+            let nanos = now.timestamp_subsec_nanos() as u64;
+            let ms_into = nanos / 1_000_000;
+            let wait_ms = (1000u64).saturating_sub(ms_into).max(16);
+            ctx.request_repaint_after(std::time::Duration::from_millis(wait_ms));
         }
 
         let locked = !self.engine.lock().unlocked;
@@ -1107,7 +1122,7 @@ clip={:?}
                             .get(cursor.saturating_add(1))
                             .map(|i| i.label.clone())
                             .unwrap_or_else(|| "(fim da lista)".into());
-                        let elapsed = if eng.playing {
+                        let elapsed_raw = if eng.playing {
                             eng.player.elapsed().as_secs_f32()
                         } else {
                             0.0
@@ -1118,7 +1133,8 @@ clip={:?}
                         } else {
                             listed.or(eng.track_duration)
                         };
-                        let remaining = dur.map(|d| (d - elapsed).max(0.0));
+                        let (elapsed, remaining) =
+                            crate::audio::format_playhead(elapsed_raw, dur);
                         let playing = eng.playing;
                         (now, next, remaining, elapsed, dur, playing)
                     };
@@ -1708,13 +1724,10 @@ clip={:?}
                             });
                     }
                     if let Some(i) = play_idx {
-                        let mut e = self.engine.lock();
-                        e.playlist.cursor = i;
-                        let _ = e.play_current_item();
-                    }                    if let Some(i) = play_idx {
-                        let mut e = self.engine.lock();
-                        e.playlist.cursor = i;
-                        let _ = e.play_current_item();
+                        // Same command as command-bar Play for this index: main channel,
+                        // playing=true, exactly one primary voice (debounced by single
+                        // play_idx per frame — egui clicked() only selects).
+                        let _ = self.engine.lock().play_playlist_index(i);
                     }
                     ui.add_space(4.0);
                     ui.allocate_ui_with_layout(
@@ -2875,7 +2888,7 @@ clip={:?}
                     }
                     ui.separator();
                     ui.heading("Hora certa");
-                    ui.label("Clips Time/ (HRS/MIN). Se ausentes, Anunciar hora tenta SAPI pt-BR.");
+                    ui.label("Clips Time/ (HRS/MIN). Se ausentes, Anunciar hora usa TTS nativo Windows (pt-BR) no canal de jingle — sem travar a UI.");
                     let tf = eng.config.time_folder.clone().unwrap_or_else(|| {
                         crate::config::beside_exe("Time").display().to_string()
                     });
