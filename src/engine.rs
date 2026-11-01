@@ -68,6 +68,8 @@ pub struct Engine {
     pub sapi_slot: announce::SapiSlot,
     /// true enquanto um worker TTS está em andamento (evita spawns duplicados).
     pub sapi_busy: bool,
+    /// true while time-announce clips/TTS are in flight (status footer).
+    pub announce_active: bool,
 }
 
 impl Engine {
@@ -141,6 +143,7 @@ impl Engine {
             announce_queue: std::collections::VecDeque::new(),
             sapi_slot: std::sync::Arc::new(std::sync::Mutex::new(None)),
             sapi_busy: false,
+            announce_active: false,
         })
     }
 
@@ -307,6 +310,7 @@ impl Engine {
                     Ok(path) => {
                         self.announce_queue.push_back(path);
                         self.set_status("Anunciando hora...");
+                        self.announce_active = true;
                     }
                     Err(e) => {
                         self.set_status(format!(
@@ -321,6 +325,28 @@ impl Engine {
         if !self.announce_queue.is_empty() && self.jingle_player.is_empty() {
             if let Some(next) = self.announce_queue.pop_front() {
                 let _ = self.jingle_player.play_file(&next);
+            }
+        }
+
+        // Clear "Anunciando hora..." once clips/TTS finished.
+        if self.announce_active
+            && !self.sapi_busy
+            && self.announce_queue.is_empty()
+            && self.jingle_player.is_empty()
+        {
+            self.announce_active = false;
+            if self.status.message.starts_with("Anunciando hora") {
+                if self.playing && !self.player.is_empty() {
+                    let title = self
+                        .playlist
+                        .items
+                        .get(self.playlist.cursor)
+                        .map(|i| i.label.clone())
+                        .unwrap_or_else(|| "No ar".into());
+                    self.set_status(format!("No ar: {title}"));
+                } else {
+                    self.set_status("Pronto");
+                }
             }
         }
 
@@ -965,7 +991,10 @@ impl Engine {
                 self.announce_queue = clips.into();
                 if let Some(first) = self.announce_queue.pop_front() {
                     match self.jingle_player.play_file(&first) {
-                        Ok(()) => self.set_status("Anunciando hora..."),
+                        Ok(()) => {
+                            self.set_status("Anunciando hora...");
+                            self.announce_active = true;
+                        }
                         Err(e) => self.set_status(format!("Erro ao anunciar hora: {e}")),
                     }
                 }
@@ -975,6 +1004,7 @@ impl Engine {
                 // Sem clips: TTS nativo em worker (nunca PowerShell, nunca na UI thread).
                 if self.sapi_busy {
                     self.set_status("Anunciando hora...");
+                    self.announce_active = true;
                     return;
                 }
                 if !announce::native_tts_available() {
@@ -988,6 +1018,7 @@ impl Engine {
                 }
                 self.sapi_busy = true;
                 self.set_status("Anunciando hora...");
+                self.announce_active = true;
                 announce::spawn_synthesize_time_to_slot(std::sync::Arc::clone(&self.sapi_slot));
                 let _ = e; // motivo dos clips fica no log se necessário
             }
