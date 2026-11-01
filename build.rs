@@ -38,8 +38,8 @@ fn main() {
             "OndaLivre - automacao de radio portatil (Fluent UI)",
         );
         res.set("CompanyName", "Rodrigo Miquilino");
-        res.set("FileVersion", "1.0.1");
-        res.set("ProductVersion", "1.0.1");
+        res.set("FileVersion", "1.0.2");
+        res.set("ProductVersion", "1.0.2");
         res.set("OriginalFilename", "ondalivre.exe");
         res.set("InternalName", "ondalivre");
         res.set("LegalCopyright", "Copyright (c) Rodrigo Miquilino");
@@ -67,12 +67,12 @@ BEGIN
     BEGIN
       VALUE "CompanyName", "Rodrigo Miquilino"
       VALUE "FileDescription", "OndaLivre - automacao de radio portatil (Fluent UI)"
-      VALUE "FileVersion", "1.0.1"
+      VALUE "FileVersion", "1.0.2"
       VALUE "InternalName", "ondalivre"
       VALUE "LegalCopyright", "Copyright (c) Rodrigo Miquilino"
       VALUE "OriginalFilename", "ondalivre.exe"
       VALUE "ProductName", "OndaLivre"
-      VALUE "ProductVersion", "1.0.1"
+      VALUE "ProductVersion", "1.0.2"
     END
   END
   BLOCK "VarFileInfo"

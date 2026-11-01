@@ -1,6 +1,6 @@
 [package]
 name = "ondalivre"
-version = "1.0.1"
+version = "1.0.2"
 edition = "2021"
 description = "Automação de rádio portátil original (interoperável com listas ZaraRadio)"
 license = "MIT"
