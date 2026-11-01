@@ -16,4 +16,5 @@ pub mod scheduler;
 pub mod stream;
 pub mod sweepers;
 pub mod tth;
+pub mod update;
 pub mod ui;

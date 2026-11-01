@@ -78,27 +78,25 @@ impl Player {
     }
 
     pub fn fade_stop(&self, fade_secs: f32) {
-        let sink_arc = self.sink.clone();
-        let started = self.started.clone();
-        let current = self.current_path.clone();
+        // Take ownership immediately so a concurrent play_file cannot be stolen
+        // by this fade thread (toggle-stop race on the jingle channel).
+        let Some(sink) = self.sink.lock().take() else {
+            *self.started.lock() = None;
+            *self.current_path.lock() = None;
+            return;
+        };
+        *self.started.lock() = None;
+        *self.current_path.lock() = None;
         let vol0 = *self.volume.lock();
         std::thread::spawn(move || {
             let steps = 20;
             let step = Duration::from_secs_f32((fade_secs.max(0.05)) / steps as f32);
             for i in 0..steps {
                 let factor = 1.0 - (i as f32 / steps as f32);
-                if let Some(sink) = sink_arc.lock().as_ref() {
-                    sink.set_volume(vol0 * factor);
-                } else {
-                    break;
-                }
+                sink.set_volume(vol0 * factor);
                 std::thread::sleep(step);
             }
-            if let Some(sink) = sink_arc.lock().take() {
-                sink.stop();
-            }
-            *started.lock() = None;
-            *current.lock() = None;
+            sink.stop();
         });
     }
 

@@ -58,6 +58,12 @@ pub struct Engine {
     pub clipboard_note: Option<String>,
     pub pause_until: Option<Instant>,
     pub unlocked: bool,
+    /// Cart (page, button) currently playing on jingle_player, if any.
+    pub active_jingle: Option<(usize, usize)>,
+    /// Probed duration of the active jingle (secs), for progress UI.
+    pub jingle_duration: Option<f32>,
+    /// Fila de clips de anuncio (hora/TTH) no canal de jingle.
+    pub announce_queue: std::collections::VecDeque<PathBuf>,
 }
 
 impl Engine {
@@ -126,6 +132,9 @@ impl Engine {
             clipboard_note: None,
             pause_until: None,
             unlocked,
+            active_jingle: None,
+            jingle_duration: None,
+            announce_queue: std::collections::VecDeque::new(),
         })
     }
 
@@ -268,6 +277,48 @@ impl Engine {
                 self.set_status("Satélite OFF (tempo esgotado)");
             }
         }
+
+        // Anuncios (hora/TTH) enfileirados no canal de jingle.
+        if !self.announce_queue.is_empty() && self.jingle_player.is_empty() {
+            if let Some(next) = self.announce_queue.pop_front() {
+                let _ = self.jingle_player.play_file(&next);
+            }
+        }
+
+        // Jingle channel: clear finished carts; restart if loop_mode (Zara LoopN).
+        if let Some((page, idx)) = self.active_jingle {
+            if self.jingle_player.is_empty() {
+                let loop_mode = self
+                    .jingles
+                    .pages
+                    .get(page)
+                    .and_then(|p| p.buttons.get(idx))
+                    .map(|b| b.loop_mode)
+                    .unwrap_or(false);
+                if loop_mode {
+                    if let Some(path) = self
+                        .jingles
+                        .pages
+                        .get(page)
+                        .and_then(|p| p.buttons.get(idx))
+                        .and_then(|b| b.path.clone())
+                    {
+                        if self.jingle_player.play_file(&path).is_ok() {
+                            self.jingle_duration = crate::fade::probe_duration_secs(&path);
+                        } else {
+                            self.active_jingle = None;
+                            self.jingle_duration = None;
+                        }
+                    } else {
+                        self.active_jingle = None;
+                        self.jingle_duration = None;
+                    }
+                } else {
+                    self.active_jingle = None;
+                    self.jingle_duration = None;
+                }
+            }
+        }
     }
 
     fn enqueue_event(&mut self, ev: ScheduledEvent) {
@@ -335,7 +386,7 @@ impl Engine {
                 Ok(())
             }
             EventAction::Time => {
-                let clips = announce::time_clips_now()?;
+                let clips = announce::time_clips_for(&self.config)?;
                 self.pending_sequence = clips.into();
                 if let Some(first) = self.pending_sequence.pop_front() {
                     self.play_path(&first, "Hora certa")
@@ -344,11 +395,11 @@ impl Engine {
                 }
             }
             EventAction::Temperature => {
-                let clip = announce::temperature_clip(self.config.temperature_c)?;
+                let clip = announce::temperature_clip_for(&self.config, self.config.temperature_c)?;
                 self.play_path(&clip, "Temperatura")
             }
             EventAction::Humidity => {
-                let clip = announce::humidity_clip(self.config.humidity_pct)?;
+                let clip = announce::humidity_clip_for(&self.config, self.config.humidity_pct)?;
                 self.play_path(&clip, "Umidade")
             }
             EventAction::Random => {
@@ -413,7 +464,7 @@ impl Engine {
                 self.play_path(&track, &item.label)
             }
             ItemKind::Time => {
-                let clips = announce::time_clips_now()?;
+                let clips = announce::time_clips_for(&self.config)?;
                 self.pending_sequence = clips.into();
                 if let Some(first) = self.pending_sequence.pop_front() {
                     self.play_path(&first, "Hora certa")
@@ -422,11 +473,11 @@ impl Engine {
                 }
             }
             ItemKind::Temperature => {
-                let clip = announce::temperature_clip(self.config.temperature_c)?;
+                let clip = announce::temperature_clip_for(&self.config, self.config.temperature_c)?;
                 self.play_path(&clip, "Temperatura")
             }
             ItemKind::Humidity => {
-                let clip = announce::humidity_clip(self.config.humidity_pct)?;
+                let clip = announce::humidity_clip_for(&self.config, self.config.humidity_pct)?;
                 self.play_path(&clip, "Umidade")
             }
             ItemKind::LoadEvents => {
@@ -648,7 +699,13 @@ impl Engine {
         Ok(())
     }
 
+    /// ZaraRadio parity: clicking the same playing cart again stops it (toggle).
+    /// A different cart starts immediately (exclusive on the jingle channel).
     pub fn fire_jingle(&mut self, page: usize, idx: usize) {
+        if self.is_jingle_cart_playing(page, idx) {
+            self.stop_jingle(0.15);
+            return;
+        }
         let Some(page_ref) = self.jingles.pages.get(page) else {
             return;
         };
@@ -659,11 +716,52 @@ impl Engine {
             self.set_status("Cart sem arquivo");
             return;
         };
-        if let Err(e) = self.jingle_player.play_file(path) {
+        let path = path.clone();
+        let name = btn.name.clone();
+        let loop_mode = btn.loop_mode;
+        if let Err(e) = self.jingle_player.play_file(&path) {
+            self.active_jingle = None;
+            self.jingle_duration = None;
             self.set_status(format!("Erro jingle: {e}"));
         } else {
-            self.set_status(format!("Jingle: {}", btn.name));
+            self.active_jingle = Some((page, idx));
+            self.jingle_duration = crate::fade::probe_duration_secs(&path);
+            let loop_tag = if loop_mode { " (loop)" } else { "" };
+            self.set_status(format!("Jingle: {name}{loop_tag}"));
         }
+    }
+
+    pub fn is_jingle_cart_playing(&self, page: usize, idx: usize) -> bool {
+        self.active_jingle == Some((page, idx)) && !self.jingle_player.is_empty()
+    }
+
+    pub fn jingle_is_playing(&self) -> bool {
+        self.active_jingle.is_some() && !self.jingle_player.is_empty()
+    }
+
+    /// Stop the jingle channel with a short fade (Zara: re-click / Esc stops carts;
+    /// playlist Stop does not).
+    pub fn stop_jingle(&mut self, fade_secs: f32) {
+        if self.active_jingle.is_none() && self.jingle_player.is_empty() {
+            return;
+        }
+        if fade_secs > 0.01 {
+            self.jingle_player.fade_stop(fade_secs);
+        } else {
+            self.jingle_player.stop_immediate();
+        }
+        self.active_jingle = None;
+        self.jingle_duration = None;
+        self.set_status("Jingle parado");
+    }
+
+    pub fn stop_all_jingles(&mut self) {
+        self.stop_jingle(0.15);
+    }
+
+    /// Pure toggle decision (unit-testable without audio hardware).
+    pub fn jingle_click_should_stop(active: Option<(usize, usize)>, page: usize, idx: usize, playing: bool) -> bool {
+        playing && active == Some((page, idx))
     }
 
     pub fn cue(&mut self, path: &PathBuf) {
@@ -680,12 +778,44 @@ impl Engine {
         }
     }
 
+
+    /// True se playlist, jingle ou anuncio estiverem tocando (nao interromper para update).
+    pub fn anything_on_air(&self) -> bool {
+        (self.playing && !self.player.is_empty())
+            || !self.jingle_player.is_empty()
+            || !self.announce_queue.is_empty()
+    }
+
+    pub fn snapshot_restart_state(&self) -> crate::update::RestartState {
+        crate::update::RestartState {
+            playlist: self.config.last_playlist.clone(),
+            cursor: self.playlist.cursor,
+            volume: self.config.volume,
+            was_playing: self.playing && !self.player.is_empty(),
+        }
+    }
+
     pub fn announce_time(&mut self) {
-        if let Ok(clips) = announce::time_clips_now() {
-            self.pending_sequence = clips.into();
-            if let Some(first) = self.pending_sequence.pop_front() {
-                let _ = self.play_path(&first, "Hora certa");
-                self.playing = true;
+        match announce::time_clips_for(&self.config) {
+            Ok(clips) if !clips.is_empty() => {
+                self.announce_queue = clips.into();
+                if let Some(first) = self.announce_queue.pop_front() {
+                    match self.jingle_player.play_file(&first) {
+                        Ok(()) => self.set_status("Anunciando hora"),
+                        Err(e) => self.set_status(format!("Erro ao anunciar hora: {e}")),
+                    }
+                }
+            }
+            Ok(_) => self.set_status("Nenhum clip de hora encontrado"),
+            Err(e) => {
+                match announce::speak_time_sapi_ptbr() {
+                    Ok(()) => self.set_status(format!(
+                        "Hora anunciada por voz (SAPI). Para clips: Configurações > Hora certa. ({e})"
+                    )),
+                    Err(_) => self.set_status(format!(
+                        "{e}. Configure a pasta Time/ em Configurações > Hora certa (ao lado do .exe ou escolha via dialogo)."
+                    )),
+                }
             }
         }
     }

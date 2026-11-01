@@ -1,7 +1,8 @@
 mod theme;
 mod icons;
 mod dialogs;
-pub use theme::*;
+pub use std::collections::BTreeSet;
+use theme::*;
 use icons::IconSet;
 
 use crate::config::PlaylistMode;
@@ -13,6 +14,7 @@ use crate::sweepers::{SweeperBook, SweeperEntry};
 use chrono::{Local, NaiveDate, Timelike};
 use eframe::egui::{self, Color32, RichText, Stroke};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
 
 #[derive(Default, Clone, Copy, PartialEq, Eq)]
 pub enum NavPage {
@@ -42,6 +44,13 @@ pub struct Windows {
     pub logs: bool,
 }
 
+#[derive(Clone)]
+pub struct LibEntry {
+    pub path: PathBuf,
+    pub is_dir: bool,
+    pub duration_secs: Option<f32>,
+}
+
 pub struct OndaApp {
     pub engine: SharedEngine,
     pub windows: Windows,
@@ -52,6 +61,8 @@ pub struct OndaApp {
     pub folder_results: Vec<PathBuf>,
     pub anim: f32,
     pub selected: Option<usize>,
+    /// Multi-seleção da playlist (Ctrl/Shift+clique). Inclui `selected` quando definido.
+    pub selection: BTreeSet<usize>,
     pub event_draft: EventDraft,
     pub jingle_page: usize,
     pub toast_alpha: f32,
@@ -68,6 +79,19 @@ pub struct OndaApp {
     pub drop_insert_at: Option<usize>,
     /// Evita reaplicar Visuals todo frame (CPU/GPU).
     pub last_theme_key: Option<(bool, u32)>,
+    /// Canal de resultado do check de atualizacao (thread).
+    update_rx: Option<mpsc::Receiver<Result<crate::update::CheckResult, String>>>,
+    /// Oferta de update pronta para o usuario (nunca aplica no ar).
+    pub update_offer: Option<crate::update::ReleaseInfo>,
+    pub update_status: Option<String>,
+    update_check_started: bool,
+    /// Aplicar ao fechar o app.
+    pub update_on_close: bool,
+    pub show_release_notes: bool,
+    /// Biblioteca: pasta atual, filtro e lista de arquivos.
+    pub lib_dir: Option<PathBuf>,
+    pub lib_filter: String,
+    pub lib_entries: Vec<LibEntry>,
 }
 
 #[derive(Clone)]
@@ -116,6 +140,7 @@ impl OndaApp {
             folder_results: vec![],
             anim: 0.0,
             selected: None,
+            selection: BTreeSet::new(),
             event_draft: EventDraft::default(),
             jingle_page: 0,
             toast_alpha: 0.0,
@@ -130,6 +155,15 @@ impl OndaApp {
             vu: 0.0,
             drop_insert_at: None,
             last_theme_key: None,
+            update_rx: None,
+            update_offer: None,
+            update_status: None,
+            update_check_started: false,
+            update_on_close: false,
+            show_release_notes: false,
+            lib_dir: None,
+            lib_filter: String::new(),
+            lib_entries: Vec::new(),
         }
     }
 
@@ -169,14 +203,17 @@ impl eframe::App for OndaApp {
             apply_fluent(ctx, dark, accent);
             self.last_theme_key = Some(theme_key);
         }
+        self.poll_updates(ctx);
         let dt = ctx.input(|i| i.stable_dt).min(0.05);
-        let (playing, satellite_live) = {
+        let (playing, satellite_live, jingle_live) = {
             let mut eng = self.engine.lock();
             eng.tick();
             let playing = eng.playing && !eng.player.is_empty();
+            let jingle_live = eng.jingle_is_playing();
             let satellite_live = eng.satellite_live;
             let msg = eng.status.message.to_ascii_lowercase();
-            let alert = ["senha", "erro", "incorreta", "descartado", "expirou", "falha", "ignorado", "soltos", "import"]
+            let alert = ["senha", "erro", "incorreta", "descartado", "expirou", "falha", "ignorado", "soltos", "import",
+                "configura", "pasta", "hora", "anunci", "atualiz", "sapi", "clip", "download", "sha"]
                 .iter()
                 .any(|k| msg.contains(k));
             if alert && eng.status.at.elapsed().as_secs_f32() < 2.5 {
@@ -187,9 +224,9 @@ impl eframe::App for OndaApp {
             if eng.postit.is_some() {
                 self.windows.postit = true;
             }
-            (playing, satellite_live)
+            (playing, satellite_live, jingle_live)
         };
-        let animating = playing || satellite_live || self.toast_alpha > 0.01;
+        let animating = playing || satellite_live || jingle_live || self.toast_alpha > 0.01;
         if animating {
             self.anim = (self.anim + dt * 1.8) % 1000.0;
             let target = if playing {
@@ -269,7 +306,14 @@ impl eframe::App for OndaApp {
         self.bottom_gutter(ctx, dark);
         self.central(ctx, dark);
         self.draw_windows(ctx, dark);
+        self.win_update_offer(ctx, dark);
         self.toast(ctx);
+    }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        if self.update_on_close {
+            self.apply_pending_update_now();
+        }
     }
 }
 
@@ -340,6 +384,22 @@ impl OndaApp {
     }
 
 
+
+    fn selection_indices(&self) -> Vec<usize> {
+        if !self.selection.is_empty() {
+            self.selection.iter().copied().collect()
+        } else if let Some(i) = self.selected {
+            vec![i]
+        } else {
+            vec![]
+        }
+    }
+
+    fn clear_selection(&mut self) {
+        self.selected = None;
+        self.selection.clear();
+    }
+
     fn playlist_action_bar(&mut self, ui: &mut egui::Ui) {
         let width = ui.available_width();
         let compact = true; // always single-row; avoids wrap clipping at card bottom
@@ -357,8 +417,9 @@ impl OndaApp {
                 .on_hover_text("Ctrl+C")
                 .clicked()
             {
-                if let Some(i) = app.selected {
-                    app.engine.lock().playlist.copy_indices(&[i]);
+                let idx = app.selection_indices();
+                if !idx.is_empty() {
+                    app.engine.lock().playlist.copy_indices(&idx);
                 }
             }
             if subtle_icon_button(
@@ -370,9 +431,10 @@ impl OndaApp {
                 .on_hover_text("Ctrl+X")
                 .clicked()
             {
-                if let Some(i) = app.selected {
-                    app.engine.lock().playlist.cut_indices(&[i]);
-                    app.selected = None;
+                let idx = app.selection_indices();
+                if !idx.is_empty() {
+                    app.engine.lock().playlist.cut_indices(&idx);
+                    app.clear_selection();
                 }
             }
             if subtle_icon_button(
@@ -395,9 +457,10 @@ impl OndaApp {
                 .on_hover_text("Delete")
                 .clicked()
             {
-                if let Some(i) = app.selected {
-                    app.engine.lock().playlist.remove_indices(&[i]);
-                    app.selected = None;
+                let idx = app.selection_indices();
+                if !idx.is_empty() {
+                    app.engine.lock().playlist.remove_indices(&idx);
+                    app.clear_selection();
                 }
             }
         };
@@ -604,18 +667,88 @@ impl OndaApp {
     }
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
-        let (ctrl_f, ctrl_o, ctrl_s, del, ctrl_c, ctrl_x, ctrl_v) = ctx.input(|i| {
-            let ctrl = i.modifiers.command || i.modifiers.ctrl;
-            (
-                ctrl && i.key_pressed(egui::Key::F),
-                ctrl && i.key_pressed(egui::Key::O),
-                ctrl && i.key_pressed(egui::Key::S),
-                i.key_pressed(egui::Key::Delete),
-                ctrl && i.key_pressed(egui::Key::C),
-                ctrl && i.key_pressed(egui::Key::X),
-                ctrl && i.key_pressed(egui::Key::V),
-            )
+        // Global hotkeys must run at the top of `update` (before panels) and
+        // *consume* keys so focused ScrollArea / buttons cannot swallow them.
+        // Skip only when a text field wants keyboard input (previous frame).
+        let text_focused = ctx.wants_keyboard_input();
+
+        // Snapshot presses via consume_key (mut input) so they fire once.
+        let mut pressed_f = [false; 12];
+        let mut escape = false;
+        let mut page_up = false;
+        let mut page_down = false;
+        let mut ctrl_f = false;
+        let mut ctrl_o = false;
+        let mut ctrl_s = false;
+        let mut del = false;
+        let mut ctrl_c = false;
+        let mut ctrl_x = false;
+        let mut ctrl_v = false;
+
+        ctx.input_mut(|i| {
+            let none = egui::Modifiers::NONE;
+            let ctrl = egui::Modifiers::CTRL;
+            let cmd = egui::Modifiers::COMMAND;
+
+            if !text_focused {
+                let fkeys = [
+                    egui::Key::F1,
+                    egui::Key::F2,
+                    egui::Key::F3,
+                    egui::Key::F4,
+                    egui::Key::F5,
+                    egui::Key::F6,
+                    egui::Key::F7,
+                    egui::Key::F8,
+                    egui::Key::F9,
+                    egui::Key::F10,
+                    egui::Key::F11,
+                    egui::Key::F12,
+                ];
+                for (n, key) in fkeys.into_iter().enumerate() {
+                    // Accept plain F-key (no modifiers). consume so nothing else sees it.
+                    if i.consume_key(none, key) {
+                        pressed_f[n] = true;
+                    }
+                }
+                if i.consume_key(none, egui::Key::Escape) {
+                    escape = true;
+                }
+                if i.consume_key(none, egui::Key::PageUp) {
+                    page_up = true;
+                }
+                if i.consume_key(none, egui::Key::PageDown) {
+                    page_down = true;
+                }
+            }
+
+            // Clipboard / file shortcuts: still allow when text focused? Ctrl+C/V
+            // should stay with TextEdit — skip those when text_focused.
+            if i.consume_key(ctrl, egui::Key::F) || i.consume_key(cmd, egui::Key::F) {
+                ctrl_f = true;
+            }
+            if i.consume_key(ctrl, egui::Key::O) || i.consume_key(cmd, egui::Key::O) {
+                ctrl_o = true;
+            }
+            if i.consume_key(ctrl, egui::Key::S) || i.consume_key(cmd, egui::Key::S) {
+                ctrl_s = true;
+            }
+            if !text_focused {
+                if i.consume_key(none, egui::Key::Delete) {
+                    del = true;
+                }
+                if i.consume_key(ctrl, egui::Key::C) || i.consume_key(cmd, egui::Key::C) {
+                    ctrl_c = true;
+                }
+                if i.consume_key(ctrl, egui::Key::X) || i.consume_key(cmd, egui::Key::X) {
+                    ctrl_x = true;
+                }
+                if i.consume_key(ctrl, egui::Key::V) || i.consume_key(cmd, egui::Key::V) {
+                    ctrl_v = true;
+                }
+            }
         });
+
         if ctrl_f {
             self.windows.find = true;
         }
@@ -628,21 +761,60 @@ impl OndaApp {
                 let _ = eng.playlist.save_list_file(&path);
             }
         }
-        if let Some(i) = self.selected {
+        // Esc: stop all jingles (Zara carts are independent of playlist Stop/S).
+        if escape {
+            self.engine.lock().stop_all_jingles();
+            Self::log_hotkey("Esc -> stop_all_jingles");
+        }
+        if page_up {
+            self.jingle_page = self.jingle_page.saturating_sub(1);
+            Self::log_hotkey(&format!("PageUp -> jingle_page={}", self.jingle_page));
+        }
+        if page_down {
+            let max_page = self
+                .engine
+                .lock()
+                .jingles
+                .pages
+                .len()
+                .saturating_sub(1);
+            self.jingle_page = (self.jingle_page + 1).min(max_page);
+            Self::log_hotkey(&format!("PageDown -> jingle_page={}", self.jingle_page));
+        }
+        for (i, pressed) in pressed_f.into_iter().enumerate() {
+            if pressed {
+                Self::log_hotkey(&format!("F{} -> fire_jingle(page={}, idx={})", i + 1, self.jingle_page, i));
+                self.engine.lock().fire_jingle(self.jingle_page, i);
+            }
+        }
+        let indices = self.selection_indices();
+        if !indices.is_empty() {
             if ctrl_c {
-                self.engine.lock().playlist.copy_indices(&[i]);
+                self.engine.lock().playlist.copy_indices(&indices);
             }
             if ctrl_x {
-                self.engine.lock().playlist.cut_indices(&[i]);
-                self.selected = None;
+                self.engine.lock().playlist.cut_indices(&indices);
+                self.clear_selection();
             }
             if del {
-                self.engine.lock().playlist.remove_indices(&[i]);
-                self.selected = None;
+                self.engine.lock().playlist.remove_indices(&indices);
+                self.clear_selection();
             }
         }
         if ctrl_v {
             self.engine.lock().playlist.paste_at(self.selected);
+        }
+    }
+
+    fn log_hotkey(msg: &str) {
+        use std::io::Write;
+        let path = crate::config::beside_exe("ol-hotkeys.txt");
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            let _ = writeln!(f, "{}", msg);
         }
     }
 
@@ -691,7 +863,6 @@ impl OndaApp {
                     (NavPage::Jingles, "music_note", "Editar jingles"),
                     (NavPage::Sweepers, "pulse", "Sweepers"),
                     (NavPage::Library, "library", "Biblioteca"),
-                    (NavPage::Devices, "speaker", "Dispositivos"),
                     (NavPage::Logs, "document", "Logs"),
                     (NavPage::Settings, "settings", "Configurações"),
                 ] {
@@ -713,6 +884,9 @@ impl OndaApp {
                 }
                 if self.nav_icon_btn(ui, "info", "Sobre", false).clicked() {
                     self.windows.about = true;
+                }
+                if self.nav_icon_btn(ui, "document", "Verificar atualizações", false).clicked() {
+                    self.start_update_check(true);
                 }
                 ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
                     ui.add_space(SPACE_2);
@@ -751,7 +925,10 @@ impl OndaApp {
                     if play_r.clicked() {
                         self.engine.lock().play();
                     }
-                    if subtle_button(ui, "Stop", dark).clicked() {
+                    if subtle_button(ui, "Stop", dark)
+                        .on_hover_text("Para a playlist (S no Zara). Jingles: re-clique o cart ou Esc.")
+                        .clicked()
+                    {
                         self.engine.lock().stop();
                     }
                     if subtle_button(ui, "Próximo", dark).clicked() {
@@ -806,7 +983,8 @@ impl OndaApp {
             )
             .show(ctx, |ui| {
                 match self.nav {
-                    NavPage::Studio | NavPage::Library => self.studio_view(ui, dark),
+                    NavPage::Studio => self.studio_view(ui, dark),
+                    NavPage::Library => self.page_library(ui, dark),
                     NavPage::Events => self.page_events(ui, dark),
                     NavPage::Jingles => self.page_jingles(ui, dark),
                     NavPage::Sweepers => self.page_sweepers(ui, dark),
@@ -1179,14 +1357,23 @@ clip={:?}
                     let mut play_idx = None;
                     {
                         let eng = self.engine.lock();
-                        let rows: Vec<(usize, String, bool, String, bool)> = eng
+                        let cursor = eng.playlist.cursor;
+                        let is_playing_air = eng.playing && !eng.player.is_empty();
+                        let next_idx = if is_playing_air {
+                            eng.playlist.items.get(cursor.saturating_add(1)).map(|_| cursor + 1)
+                        } else {
+                            None
+                        };
+                        let rows: Vec<(usize, String, bool, bool, bool, String, bool)> = eng
                             .playlist
                             .items
                             .iter()
                             .enumerate()
                             .map(|(i, item)| {
-                                let selected =
-                                    self.selected == Some(i) || eng.playlist.cursor == i;
+                                let playing = is_playing_air && cursor == i;
+                                let selected = self.selection.contains(&i)
+                                    || self.selected == Some(i);
+                                let is_next = next_idx == Some(i) && !playing;
                                 let base = if eng.config.show_full_path {
                                     item.path.display().to_string()
                                 } else {
@@ -1197,7 +1384,7 @@ clip={:?}
                                     .duration_secs
                                     .map(fmt_mmss)
                                     .unwrap_or_else(|| "--:--".into());
-                                (i, name, selected, dur, i % 2 == 1)
+                                (i, name, playing, selected, is_next, dur, i % 2 == 1)
                             })
                             .collect();
                         let empty = rows.is_empty();
@@ -1221,22 +1408,39 @@ clip={:?}
                                         "Solte arquivos ou pastas, ou use Abrir lista (Ctrl+O).",
                                     );
                                 }
-                                for (i, name, selected, dur, alt) in rows {
+                                for (i, name, playing, selected, is_next, dur, alt) in rows {
                                     let row_h = 30.0;
                                     let (rect, resp) = ui.allocate_exact_size(
                                         egui::vec2(ui.available_width(), row_h),
                                         egui::Sense::click(),
                                     );
+                                    // Distinct states: playing != selected (parity miss fix).
                                     let mut fill = Color32::TRANSPARENT;
-                                    if selected {
+                                    if playing {
+                                        // Subtle green/accent tint (not solid teal wash).
                                         fill = Color32::from_rgba_unmultiplied(
-                                            accent.r(),
-                                            accent.g(),
-                                            accent.b(),
-                                            if dark { 48 } else { 36 },
+                                            0x2E,
+                                            0x7D,
+                                            0x4F,
+                                            if dark { 56 } else { 40 },
                                         );
+                                        if selected {
+                                            // Combine: keep playing tint, slightly stronger.
+                                            fill = Color32::from_rgba_unmultiplied(
+                                                0x2E,
+                                                0x7D,
+                                                0x4F,
+                                                if dark { 78 } else { 56 },
+                                            );
+                                        }
+                                    } else if selected {
+                                        // Fluent list selection: white alpha ~8%.
+                                        fill = if dark {
+                                            Color32::from_rgba_unmultiplied(255, 255, 255, 20)
+                                        } else {
+                                            Color32::from_rgba_unmultiplied(0, 0, 0, 18)
+                                        };
                                     } else if alt {
-                                        // ~alpha 4: opaque +4 over card 0x2D (from_white_alpha gamma-boosts to ~78)
                                         fill = if dark {
                                             Color32::from_rgb(0x31, 0x31, 0x31)
                                         } else {
@@ -1250,6 +1454,29 @@ clip={:?}
                                         };
                                     }
                                     ui.painter().rect_filled(rect, 0.0, fill);
+                                    if playing {
+                                        // 3px left accent bar
+                                        let bar = egui::Rect::from_min_max(
+                                            egui::pos2(rect.left(), rect.top()),
+                                            egui::pos2(rect.left() + 3.0, rect.bottom()),
+                                        );
+                                        ui.painter().rect_filled(bar, 0.0, accent);
+                                    }
+                                    if selected && !playing {
+                                        ui.painter().rect_stroke(
+                                            rect.shrink(0.5),
+                                            0.0,
+                                            Stroke::new(1.0_f32, accent.gamma_multiply(0.85)),
+                                            egui::StrokeKind::Inside,
+                                        );
+                                    } else if selected && playing {
+                                        ui.painter().rect_stroke(
+                                            rect.shrink(0.5),
+                                            0.0,
+                                            Stroke::new(1.0_f32, accent),
+                                            egui::StrokeKind::Inside,
+                                        );
+                                    }
                                     if file_hover {
                                         if let Some(pos) = ui.ctx().pointer_latest_pos() {
                                             if rect.contains(pos) {
@@ -1269,7 +1496,13 @@ clip={:?}
                                             }
                                         }
                                     }
-                                    let fg = if selected {
+                                    let fg = if playing {
+                                        if dark {
+                                            Color32::from_rgb(0xE8, 0xFF, 0xF0)
+                                        } else {
+                                            Color32::from_rgb(0x0A, 0x3D, 0x22)
+                                        }
+                                    } else if selected {
                                         if dark {
                                             Color32::WHITE
                                         } else {
@@ -1280,6 +1513,11 @@ clip={:?}
                                     } else {
                                         Color32::from_gray(30)
                                     };
+                                    let font = if playing {
+                                        typo::body_strong()
+                                    } else {
+                                        typo::body()
+                                    };
                                     ui.painter().text(
                                         egui::pos2(rect.left() + 10.0, rect.center().y),
                                         egui::Align2::LEFT_CENTER,
@@ -1287,33 +1525,148 @@ clip={:?}
                                         typo::caption(),
                                         secondary_color(dark),
                                     );
-                                    let short = if name.len() > 48 {
+                                    // Play / equalizer glyph for playing row
+                                    let mut text_x = rect.left() + col_num_w + 8.0;
+                                    if playing {
+                                        let t = ui.ctx().input(|i| i.time) as f32;
+                                        let bars = [
+                                            4.0 + 3.0 * ((t * 7.0).sin() * 0.5 + 0.5),
+                                            4.0 + 5.0 * (((t * 9.0) + 1.1).sin() * 0.5 + 0.5),
+                                            4.0 + 3.5 * (((t * 5.5) + 2.2).sin() * 0.5 + 0.5),
+                                        ];
+                                        let base_x = text_x;
+                                        let base_y = rect.bottom() - 6.0;
+                                        for (bi, h) in bars.iter().enumerate() {
+                                            let x = base_x + bi as f32 * 4.0;
+                                            let br = egui::Rect::from_min_max(
+                                                egui::pos2(x, base_y - *h),
+                                                egui::pos2(x + 2.5, base_y),
+                                            );
+                                            ui.painter().rect_filled(br, 0.5, accent);
+                                        }
+                                        text_x += 16.0;
+                                    }
+                                    let mut short = if name.len() > 40 {
                                         format!(
                                             "{}…",
-                                            name.chars().take(46).collect::<String>()
+                                            name.chars().take(38).collect::<String>()
                                         )
                                     } else {
                                         name
                                     };
+                                    if playing {
+                                        short = format!("{short}");
+                                    }
                                     ui.painter().text(
-                                        egui::pos2(
-                                            rect.left() + col_num_w + 8.0,
-                                            rect.center().y,
-                                        ),
+                                        egui::pos2(text_x, rect.center().y),
                                         egui::Align2::LEFT_CENTER,
                                         short,
-                                        typo::body(),
+                                        font,
                                         fg,
                                     );
+                                    // Badges on the right: No ar / Proximo / multi count
+                                    let mut right_x = rect.right() - 10.0;
                                     ui.painter().text(
-                                        egui::pos2(rect.right() - 10.0, rect.center().y),
+                                        egui::pos2(right_x, rect.center().y),
                                         egui::Align2::RIGHT_CENTER,
-                                        dur,
+                                        &dur,
                                         typo::caption(),
                                         secondary_color(dark),
                                     );
+                                    right_x -= 48.0;
+                                    if playing {
+                                        let badge = "No ar";
+                                        let galley = ui.painter().layout_no_wrap(
+                                            badge.into(),
+                                            typo::caption(),
+                                            Color32::WHITE,
+                                        );
+                                        let bw = galley.size().x + 10.0;
+                                        let bh = 16.0;
+                                        let br = egui::Rect::from_center_size(
+                                            egui::pos2(right_x - bw * 0.5, rect.center().y),
+                                            egui::vec2(bw, bh),
+                                        );
+                                        ui.painter().rect_filled(
+                                            br,
+                                            3.0,
+                                            Color32::from_rgb(0x2E, 0xA8, 0x5C),
+                                        );
+                                        ui.painter().galley(
+                                            egui::pos2(br.left() + 5.0, br.center().y - galley.size().y * 0.5),
+                                            galley,
+                                            Color32::WHITE,
+                                        );
+                                        right_x -= bw + 8.0;
+                                    } else if is_next {
+                                        let badge = "Próximo";
+                                        let galley = ui.painter().layout_no_wrap(
+                                            badge.into(),
+                                            typo::caption(),
+                                            accent,
+                                        );
+                                        let bw = galley.size().x + 10.0;
+                                        let bh = 16.0;
+                                        let br = egui::Rect::from_center_size(
+                                            egui::pos2(right_x - bw * 0.5, rect.center().y),
+                                            egui::vec2(bw, bh),
+                                        );
+                                        ui.painter().rect_filled(
+                                            br,
+                                            3.0,
+                                            Color32::from_rgba_unmultiplied(
+                                                accent.r(),
+                                                accent.g(),
+                                                accent.b(),
+                                                40,
+                                            ),
+                                        );
+                                        ui.painter().rect_stroke(
+                                            br,
+                                            3.0,
+                                            Stroke::new(1.0, accent),
+                                            egui::StrokeKind::Inside,
+                                        );
+                                        ui.painter().galley(
+                                            egui::pos2(br.left() + 5.0, br.center().y - galley.size().y * 0.5),
+                                            galley,
+                                            accent,
+                                        );
+                                    }
                                     if resp.clicked() {
-                                        self.selected = Some(i);
+                                        let modifiers = ui.input(|i| i.modifiers);
+                                        if modifiers.shift {
+                                            if let Some(anchor) = self.selected {
+                                                let (a, b) = if anchor <= i {
+                                                    (anchor, i)
+                                                } else {
+                                                    (i, anchor)
+                                                };
+                                                self.selection.clear();
+                                                for k in a..=b {
+                                                    self.selection.insert(k);
+                                                }
+                                                self.selected = Some(i);
+                                            } else {
+                                                self.selected = Some(i);
+                                                self.selection.clear();
+                                                self.selection.insert(i);
+                                            }
+                                        } else if modifiers.command || modifiers.ctrl {
+                                            if self.selection.contains(&i) {
+                                                self.selection.remove(&i);
+                                                if self.selected == Some(i) {
+                                                    self.selected = self.selection.iter().next().copied();
+                                                }
+                                            } else {
+                                                self.selection.insert(i);
+                                                self.selected = Some(i);
+                                            }
+                                        } else {
+                                            self.selected = Some(i);
+                                            self.selection.clear();
+                                            self.selection.insert(i);
+                                        }
                                     }
                                     if resp.double_clicked() {
                                         play_idx = Some(i);
@@ -1355,6 +1708,10 @@ clip={:?}
                             });
                     }
                     if let Some(i) = play_idx {
+                        let mut e = self.engine.lock();
+                        e.playlist.cursor = i;
+                        let _ = e.play_current_item();
+                    }                    if let Some(i) = play_idx {
                         let mut e = self.engine.lock();
                         e.playlist.cursor = i;
                         let _ = e.play_current_item();
@@ -1460,16 +1817,28 @@ clip={:?}
                             if subtle_button(ui, "Editar", dark).clicked() {
                                 self.nav = NavPage::Jingles;
                             }
+                            if subtle_button(ui, "Parar jingles", dark)
+                                .on_hover_text("Esc — para todos os carts (não afeta a playlist)")
+                                .clicked()
+                            {
+                                self.engine.lock().stop_all_jingles();
+                            }
                         });
                     });
                     ui.add_space(SPACE_2);
-                    let names: Vec<String> = {
+                    let (names, active, elapsed, jdur, jplaying) = {
                         let eng = self.engine.lock();
-                        eng.jingles
+                        let names: Vec<String> = eng
+                            .jingles
                             .pages
                             .get(self.jingle_page)
                             .map(|p| p.buttons.iter().map(|b| b.name.clone()).collect())
-                            .unwrap_or_default()
+                            .unwrap_or_default();
+                        let active = eng.active_jingle;
+                        let elapsed = eng.jingle_player.elapsed().as_secs_f32();
+                        let jdur = eng.jingle_duration;
+                        let jplaying = eng.jingle_is_playing();
+                        (names, active, elapsed, jdur, jplaying)
                     };
                     let cols = 3usize;
                     let rows_n = 4usize;
@@ -1527,7 +1896,7 @@ clip={:?}
                             );
                             let resp = ui.interact(
                                 rect,
-                                ui.id().with(("jpad", i)),
+                                ui.id().with(("jpad", self.jingle_page, i)),
                                 egui::Sense::click(),
                             );
                             let label = names
@@ -1539,9 +1908,18 @@ clip={:?}
                             } else {
                                 label
                             };
+                            let this_playing = jplaying
+                                && active == Some((self.jingle_page, i));
                             let fill = if dark { tints[i] } else { light_tints[i] };
                             let mut f = fill;
-                            if resp.hovered() {
+                            if this_playing {
+                                f = Color32::from_rgba_unmultiplied(
+                                    ((fill.r() as u16 + accent.r() as u16) / 2) as u8,
+                                    ((fill.g() as u16 + accent.g() as u16) / 2) as u8,
+                                    ((fill.b() as u16 + accent.b() as u16) / 2) as u8,
+                                    255,
+                                );
+                            } else if resp.hovered() {
                                 f = Color32::from_rgba_unmultiplied(
                                     ((fill.r() as u16 * 6 + accent.r() as u16 * 4) / 10) as u8,
                                     ((fill.g() as u16 * 6 + accent.g() as u16 * 4) / 10) as u8,
@@ -1562,6 +1940,52 @@ clip={:?}
                                 egui::CornerRadius::same(RADIUS_CTRL),
                                 f,
                             );
+                            // Progress fill from bottom while playing
+                            if this_playing {
+                                let progress = match jdur {
+                                    Some(d) if d > 0.05 => (elapsed / d).clamp(0.0, 1.0),
+                                    _ => 0.15,
+                                };
+                                let fill_h = rect.height() * progress;
+                                let pref = egui::Rect::from_min_max(
+                                    egui::pos2(rect.left(), rect.bottom() - fill_h),
+                                    egui::pos2(rect.right(), rect.bottom()),
+                                );
+                                ui.painter().rect_filled(
+                                    pref,
+                                    egui::CornerRadius {
+                                        nw: 0,
+                                        ne: 0,
+                                        sw: RADIUS_CTRL,
+                                        se: RADIUS_CTRL,
+                                    },
+                                    Color32::from_rgba_unmultiplied(
+                                        accent.r(),
+                                        accent.g(),
+                                        accent.b(),
+                                        90,
+                                    ),
+                                );
+                                // Stop icon top-left
+                                ui.painter().text(
+                                    egui::pos2(rect.left() + 8.0, rect.top() + 8.0),
+                                    egui::Align2::LEFT_TOP,
+                                    "■",
+                                    typo::caption(),
+                                    Color32::WHITE,
+                                );
+                                let remain = match jdur {
+                                    Some(d) => (d - elapsed).max(0.0),
+                                    None => 0.0,
+                                };
+                                ui.painter().text(
+                                    egui::pos2(rect.left() + 8.0, rect.bottom() - 6.0),
+                                    egui::Align2::LEFT_BOTTOM,
+                                    fmt_mmss(remain),
+                                    typo::caption(),
+                                    Color32::WHITE,
+                                );
+                            }
                             ui.painter().text(
                                 egui::pos2(rect.center().x, rect.center().y - 6.0),
                                 egui::Align2::CENTER_CENTER,
@@ -1583,6 +2007,18 @@ clip={:?}
                             if resp.clicked() {
                                 self.engine.lock().fire_jingle(self.jingle_page, i);
                             }
+                            resp.context_menu(|ui| {
+                                if ui.button("Parar este jingle").clicked() {
+                                    if this_playing {
+                                        self.engine.lock().stop_jingle(0.15);
+                                    }
+                                    ui.close_menu();
+                                }
+                                if ui.button("Parar jingles").clicked() {
+                                    self.engine.lock().stop_all_jingles();
+                                    ui.close_menu();
+                                }
+                            });
                         }
                     }
                     let grid_h = rows_n as f32 * pad_h + (rows_n as f32 - 1.0) * cell_gap;
@@ -1592,7 +2028,10 @@ clip={:?}
                     );
                     ui.add_space(SPACE_2);
                     ui.horizontal(|ui| {
-                        if subtle_button(ui, "◀", dark).clicked() {
+                        if subtle_button(ui, "◀", dark)
+                            .on_hover_text("Page Up")
+                            .clicked()
+                        {
                             self.jingle_page = self.jingle_page.saturating_sub(1);
                         }
                         ui.label(
@@ -1600,7 +2039,10 @@ clip={:?}
                                 .font(typo::caption())
                                 .color(secondary_color(dark)),
                         );
-                        if subtle_button(ui, "▶", dark).clicked() {
+                        if subtle_button(ui, "▶", dark)
+                            .on_hover_text("Page Down")
+                            .clicked()
+                        {
                             self.jingle_page = self.jingle_page.saturating_add(1);
                         }
                     });
@@ -1896,8 +2338,52 @@ clip={:?}
                 ui.text_edit_singleline(&mut eng.config.station_name);
                 ui.checkbox(&mut eng.config.autostart, "Autostart");
                 ui.checkbox(&mut eng.config.open_last_list, "Abrir última lista");
+                ui.separator();
+                ui.heading("Hora certa");
+                ui.label("Pasta Time/ com clips HRS/MIN (ao lado do .exe ou escolha abaixo).");
+                let tf = eng.config.time_folder.clone().unwrap_or_else(|| {
+                    crate::config::beside_exe("Time").display().to_string()
+                });
+                ui.label(dialogs::path_label(&tf));
+                let mut pick_time = false;
+                let mut clear_time = false;
+                let mut check_upd_now = false;
+                ui.horizontal(|ui| {
+                    if ui.button("Escolher pasta Time…").clicked() {
+                        pick_time = true;
+                    }
+                    if ui.button("Usar pasta ao lado do exe").clicked() {
+                        clear_time = true;
+                    }
+                });
+                if clear_time {
+                    eng.config.time_folder = None;
+                }
+                ui.separator();
+                ui.heading("Atualizações");
+                ui.checkbox(&mut eng.config.check_updates, "Verificar atualizações (GitHub)");
+                ui.add(
+                    egui::Slider::new(&mut eng.config.update_check_hours, 0.25..=48.0)
+                        .text("Re-check (horas)")
+                        .logarithmic(true),
+                );
+                if ui.button("Verificar agora").clicked() {
+                    check_upd_now = true;
+                }
                 if ui.button("Salvar config").clicked() {
                     let _ = eng.config.save();
+                }
+                drop(eng);
+                if pick_time {
+                    if let Some(dir) = self.pick_folder_native() {
+                        let mut eng = self.engine.lock();
+                        eng.config.time_folder = Some(dir.display().to_string());
+                        let _ = eng.config.save();
+                        eng.set_status(format!("Pasta Time: {}", dir.display()));
+                    }
+                }
+                if check_upd_now {
+                    self.start_update_check(true);
                 }
             });
         });
@@ -2281,7 +2767,7 @@ clip={:?}
             .open(&mut open)
             .frame(elevated_frame(dark))
             .show(ctx, |ui| {
-                ui.label("Reproduz no dispositivo de cue configurado em Dispositivos.");
+                ui.label("Reproduz no dispositivo de cue (Configurações / Opções).");
                 if ui.button("Escolher arquivo…").clicked() {
                     if let Some(p) = self.pick_audio_file() {
                         self.engine.lock().cue(&p);
@@ -2304,6 +2790,8 @@ clip={:?}
                 let mut rebind = false;
                 let mut pick_log = false;
                 let mut pick_tth = false;
+                let mut pick_time = false;
+                let mut check_upd_now = false;
                 {
                     let mut eng = self.engine.lock();
                     ui.heading("Fade / detector");
@@ -2386,6 +2874,35 @@ clip={:?}
                         eng.set_status(format!("Purgados: {n}"));
                     }
                     ui.separator();
+                    ui.heading("Hora certa");
+                    ui.label("Clips Time/ (HRS/MIN). Se ausentes, Anunciar hora tenta SAPI pt-BR.");
+                    let tf = eng.config.time_folder.clone().unwrap_or_else(|| {
+                        crate::config::beside_exe("Time").display().to_string()
+                    });
+                    ui.label(dialogs::path_label(&tf));
+                    if ui.button("Escolher pasta Time…").clicked() {
+                        pick_time = true;
+                    }
+                    ui.horizontal(|ui| {
+                        if ui.button("Limpar (usar ao lado do exe)").clicked() {
+                            eng.config.time_folder = None;
+                        }
+                    });
+                    ui.separator();
+                    ui.heading("Atualizações");
+                    ui.checkbox(
+                        &mut eng.config.check_updates,
+                        "Verificar atualizações (GitHub)",
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut eng.config.update_check_hours, 0.25..=48.0)
+                            .text("Re-check (horas)")
+                            .logarithmic(true),
+                    );
+                    if ui.button("Verificar atualizações agora").clicked() {
+                        check_upd_now = true;
+                    }
+                    ui.separator();
                     ui.heading("Senha");
                     ui.add(egui::TextEdit::singleline(&mut self.password_set_input).password(true).hint_text("Nova senha (vazio = remover)"));
                     if ui.button("Definir / limpar senha").clicked() {
@@ -2432,6 +2949,18 @@ clip={:?}
                             eng.set_status("TTH importado");
                         }
                     }
+                }
+                if pick_time {
+                    if let Some(dir) = self.pick_folder_native() {
+                        let mut eng = self.engine.lock();
+                        eng.config.time_folder = Some(dir.display().to_string());
+                        dialogs::remember(&mut eng.config, &dir);
+                        let _ = eng.config.save();
+                        eng.set_status(format!("Pasta Time: {}", dir.display()));
+                    }
+                }
+                if check_upd_now {
+                    self.start_update_check(true);
                 }
             });
         self.windows.options = open;
@@ -2489,9 +3018,17 @@ clip={:?}
             .frame(elevated_frame(dark))
             .show(ctx, |ui| {
                 ui.label(RichText::new("OndaLivre").heading());
+                ui.label(format!("Versão {}", crate::update::CURRENT_VERSION));
                 ui.label("Automação de rádio portátil em Rust.");
                 ui.label("Interface Fluent original. Sem código ou assets do ZaraRadio.");
                 ui.label("MIT");
+                ui.separator();
+                if ui.button("Verificar atualizações").clicked() {
+                    self.start_update_check(true);
+                }
+                if let Some(ref s) = self.update_status {
+                    ui.label(s);
+                }
             });
         self.windows.about = open;
     }
@@ -2620,6 +3157,403 @@ clip={:?}
             Err(e) => eng.set_status(format!("Erro ao abrir lista: {e}")),
         }
     }
+
+
+    fn start_update_check(&mut self, manual: bool) {
+        if self.update_rx.is_some() {
+            if manual {
+                self.update_status = Some("Verificação já em andamento…".into());
+            }
+            return;
+        }
+        let allow = manual || self.engine.lock().config.check_updates;
+        if !allow {
+            if manual {
+                self.engine.lock().set_status(
+                    "Verificação desligada em Configurações > Atualizações",
+                );
+            }
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        self.update_rx = Some(rx);
+        if manual {
+            self.update_status = Some("Consultando GitHub Releases…".into());
+        }
+        self.update_check_started = true;
+        // Background thread only — never on audio path.
+        std::thread::spawn(move || {
+            let res = crate::update::fetch_latest_release_cached(crate::update::GITHUB_REPO)
+                .map_err(|e| e.to_string());
+            let _ = tx.send(res);
+        });
+    }
+
+    fn poll_updates(&mut self, ctx: &egui::Context) {
+        // Startup + periodic re-check (default 6h), never blocks UI/audio.
+        if !self.update_check_started {
+            self.update_check_started = true;
+            if self.engine.lock().config.check_updates {
+                self.start_update_check(false);
+            }
+        } else if self.update_rx.is_none() {
+            let (enabled, hours) = {
+                let c = &self.engine.lock().config;
+                (c.check_updates, c.update_check_hours)
+            };
+            if enabled && crate::update::should_recheck(hours) {
+                self.start_update_check(false);
+            }
+        }
+
+        if let Some(pending) = crate::update::load_pending() {
+            if pending.when == crate::update::UpdateWhen::WhenStopped {
+                let idle = !self.engine.lock().anything_on_air();
+                if idle {
+                    self.update_on_close = false;
+                    let _ = self.stage_apply(&pending);
+                }
+            } else if pending.when == crate::update::UpdateWhen::OnClose {
+                self.update_on_close = true;
+            }
+        }
+
+        let mut done = None;
+        if let Some(rx) = &self.update_rx {
+            match rx.try_recv() {
+                Ok(v) => done = Some(v),
+                Err(mpsc::TryRecvError::Empty) => {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(500));
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.update_rx = None;
+                }
+            }
+        }
+        if let Some(res) = done {
+            self.update_rx = None;
+            match res {
+                Ok(crate::update::CheckResult::NotModified) => {
+                    if self.update_status.as_deref().map(|s| s.contains("Consultando")).unwrap_or(false) {
+                        self.update_status = Some("Sem mudanças no GitHub (ETag)".into());
+                    }
+                }
+                Ok(crate::update::CheckResult::Latest(info)) => {
+                    if crate::update::is_newer(&info.version) {
+                        if crate::update::is_dismissed(&info.version) {
+                            self.update_status = Some(format!(
+                                "Nova versão {} ignorada nesta instalação",
+                                info.version
+                            ));
+                        } else {
+                            self.update_status = Some(format!(
+                                "Nova versão {} disponível",
+                                info.version
+                            ));
+                            self.update_offer = Some(info);
+                            // Discreet toast — não modal bloqueante.
+                            self.toast_alpha = 0.85;
+                            self.engine.lock().set_status(format!(
+                                "Atualização {} disponível (InfoBar)",
+                                self.update_offer.as_ref().unwrap().version
+                            ));
+                        }
+                    } else {
+                        self.update_status = Some("Você já está na última versão".into());
+                    }
+                }
+                Err(e) => {
+                    // Repo ainda inexistente / rede: soft fail, sem atrapalhar o ar.
+                    self.update_status = Some(format!("Atualização: {e}"));
+                }
+            }
+        }
+        // Keep a gentle repaint cadence when offer is visible so InfoBar stays alive.
+        if self.update_offer.is_some() {
+            ctx.request_repaint_after(std::time::Duration::from_secs(2));
+        }
+    }
+
+    /// InfoBar não-modal (Fluent): ações sem interromper áudio.
+    fn win_update_offer(&mut self, ctx: &egui::Context, dark: bool) {
+        let Some(info) = self.update_offer.clone() else {
+            self.show_release_notes = false;
+            return;
+        };
+        egui::TopBottomPanel::top("update_infobar")
+            .exact_height(if self.show_release_notes { 160.0 } else { 40.0 })
+            .frame(
+                egui::Frame::new()
+                    .fill(if dark {
+                        Color32::from_rgb(0x1F, 0x3A, 0x5F)
+                    } else {
+                        Color32::from_rgb(0xF0, 0xF6, 0xFC)
+                    })
+                    .inner_margin(egui::Margin::symmetric(12i8, 6i8))
+                    .stroke(Stroke::new(1.0_f32, self.accent())),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(format!(
+                            "OndaLivre {} disponível (você tem {})",
+                            info.version,
+                            crate::update::CURRENT_VERSION
+                        ))
+                        .strong()
+                        .color(self.accent()),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.small_button("✕").on_hover_text("Dispensar esta versão").clicked() {
+                            crate::update::dismiss_version(&info.version);
+                            self.update_offer = None;
+                            self.show_release_notes = false;
+                        }
+                        if ui.small_button("Ver novidades").clicked() {
+                            self.show_release_notes = !self.show_release_notes;
+                        }
+                        if ui.small_button("Ao fechar").clicked() {
+                            self.download_update_offer(crate::update::UpdateWhen::OnClose);
+                        }
+                        if ui
+                            .small_button("Atualizar quando parado")
+                            .on_hover_text("Baixa agora; aplica só com nada no ar")
+                            .clicked()
+                        {
+                            self.download_update_offer(crate::update::UpdateWhen::WhenStopped);
+                        }
+                    });
+                });
+                if self.show_release_notes {
+                    ui.separator();
+                    egui::ScrollArea::vertical().max_height(110.0).show(ui, |ui| {
+                        let body = if info.body.trim().is_empty() {
+                            "(sem notas de release)"
+                        } else {
+                            info.body.as_str()
+                        };
+                        ui.label(RichText::new(body).small());
+                    });
+                }
+            });
+    }
+
+    fn download_update_offer(&mut self, when: crate::update::UpdateWhen) {
+        let Some(info) = self.update_offer.clone() else { return };
+        self.update_status = Some("Baixando atualização…".into());
+        self.engine.lock().set_status("Baixando atualização…");
+        match crate::update::download_and_stage(&info) {
+            Ok(path) => {
+                let pending = crate::update::PendingUpdate {
+                    new_exe: path,
+                    version: info.version.clone(),
+                    when: when.clone(),
+                };
+                if let Err(e) = crate::update::save_pending(&pending) {
+                    self.engine.lock().set_status(format!("Erro ao gravar pending: {e}"));
+                    return;
+                }
+                self.update_offer = None;
+                match when {
+                    crate::update::UpdateWhen::OnClose => {
+                        self.update_on_close = true;
+                        self.engine.lock().set_status(
+                            "Atualização pronta — será aplicada ao fechar".to_string(),
+                        );
+                    }
+                    crate::update::UpdateWhen::WhenStopped => {
+                        if !self.engine.lock().anything_on_air() {
+                            let _ = self.stage_apply(&pending);
+                        } else {
+                            self.engine.lock().set_status(
+                                "Atualização baixada — aplica quando o áudio parar".to_string(),
+                            );
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                self.engine.lock().set_status(format!("Download falhou: {e}"));
+                self.toast_alpha = 1.0;
+            }
+        }
+    }
+
+    fn stage_apply(&mut self, pending: &crate::update::PendingUpdate) -> anyhow::Result<()> {
+        let st = self.engine.lock().snapshot_restart_state();
+        let _ = crate::update::save_restart_state(&st);
+        let running = std::env::current_exe().unwrap_or_else(|_| crate::config::beside_exe("ondalivre.exe"));
+        let plan = crate::update::plan_swap(&running, &pending.new_exe);
+        crate::update::apply_swap(&plan)?;
+        crate::update::clear_pending();
+        self.engine.lock().set_status(format!(
+            "Atualizado para {} — reinicie o OndaLivre",
+            pending.version
+        ));
+        // Try relaunch
+        let _ = std::process::Command::new(&plan.running).spawn();
+        std::process::exit(0);
+    }
+
+    fn apply_pending_update_now(&mut self) {
+        if let Some(pending) = crate::update::load_pending() {
+            let _ = self.stage_apply(&pending);
+        }
+    }
+
+    fn refresh_library(&mut self) {
+        let Some(dir) = self.lib_dir.clone() else {
+            self.lib_entries.clear();
+            return;
+        };
+        let mut entries = Vec::new();
+        if let Ok(rd) = std::fs::read_dir(&dir) {
+            for ent in rd.flatten() {
+                let path = ent.path();
+                let is_dir = path.is_dir();
+                if is_dir {
+                    entries.push(LibEntry {
+                        path,
+                        is_dir: true,
+                        duration_secs: None,
+                    });
+                } else if crate::playlist::is_audio(&path) {
+                    let dur = crate::fade::probe_duration_secs(&path);
+                    entries.push(LibEntry {
+                        path,
+                        is_dir: false,
+                        duration_secs: dur,
+                    });
+                }
+            }
+        }
+        entries.sort_by(|a, b| match (a.is_dir, b.is_dir) {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            _ => a
+                .path
+                .file_name()
+                .cmp(&b.path.file_name()),
+        });
+        self.lib_entries = entries;
+    }
+
+    fn page_library(&mut self, ui: &mut egui::Ui, dark: bool) {
+        let avail = ui.available_size();
+        elevated_frame(dark).show(ui, |ui| {
+            ui.set_min_size(avail);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Biblioteca").heading().color(self.accent()));
+                if ui.button("Escolher pasta…").clicked() {
+                    if let Some(dir) = self.pick_folder_native() {
+                        self.lib_dir = Some(dir);
+                        self.refresh_library();
+                    }
+                }
+                if ui.button("Atualizar").clicked() {
+                    self.refresh_library();
+                }
+                if self.lib_dir.is_some() {
+                    if ui.button("Pasta acima").clicked() {
+                        if let Some(dir) = self.lib_dir.clone() {
+                            if let Some(parent) = dir.parent() {
+                                self.lib_dir = Some(parent.to_path_buf());
+                                self.refresh_library();
+                            }
+                        }
+                    }
+                }
+            });
+            if let Some(ref d) = self.lib_dir {
+                ui.label(dialogs::path_label(&d.display().to_string()));
+            } else {
+                ui.label("Escolha uma pasta de áudios para navegar (como o browser do ZaraRadio).");
+            }
+            ui.horizontal(|ui| {
+                ui.label("Filtrar");
+                ui.text_edit_singleline(&mut self.lib_filter);
+            });
+            ui.separator();
+            let filter = self.lib_filter.to_lowercase();
+            let mut open_dir: Option<PathBuf> = None;
+            let mut add_path: Option<PathBuf> = None;
+            let mut add_all = false;
+            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                for ent in &self.lib_entries {
+                    let name = ent
+                        .path
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("?")
+                        .to_string();
+                    if !filter.is_empty() && !name.to_lowercase().contains(&filter) {
+                        continue;
+                    }
+                    let label = if ent.is_dir {
+                        format!("📁 {name}")
+                    } else if let Some(d) = ent.duration_secs {
+                        format!("♪ {name}   {}", fmt_mmss(d))
+                    } else {
+                        format!("♪ {name}")
+                    };
+                    let resp = ui.selectable_label(false, label);
+                    if ent.is_dir {
+                        if resp.double_clicked() || (resp.clicked() && ui.input(|i| i.modifiers.ctrl)) {
+                            open_dir = Some(ent.path.clone());
+                        } else if resp.clicked() {
+                            open_dir = Some(ent.path.clone());
+                        }
+                    } else {
+                        if resp.double_clicked() {
+                            add_path = Some(ent.path.clone());
+                        }
+                        resp.context_menu(|ui| {
+                            if ui.button("Adicionar à playlist").clicked() {
+                                add_path = Some(ent.path.clone());
+                                ui.close_menu();
+                            }
+                        });
+                        // Drag payload for playlist drop targets if any
+                        resp.on_hover_text("Duplo-clique para adicionar à playlist");
+                    }
+                }
+            });
+            ui.horizontal(|ui| {
+                if ui.button("Adicionar todos filtrados à playlist").clicked() {
+                    add_all = true;
+                }
+            });
+            if let Some(dir) = open_dir {
+                self.lib_dir = Some(dir);
+                self.refresh_library();
+            }
+            if let Some(path) = add_path {
+                let mut eng = self.engine.lock();
+                let n = eng.playlist.insert_drop_paths(None, &[path.clone()]);
+                eng.set_status(format!("Biblioteca: +{n} ({})", path.display()));
+            }
+            if add_all {
+                let paths: Vec<PathBuf> = self
+                    .lib_entries
+                    .iter()
+                    .filter(|e| !e.is_dir)
+                    .filter(|e| {
+                        filter.is_empty()
+                            || e.path
+                                .file_name()
+                                .and_then(|s| s.to_str())
+                                .map(|n| n.to_lowercase().contains(&filter))
+                                .unwrap_or(false)
+                    })
+                    .map(|e| e.path.clone())
+                    .collect();
+                let mut eng = self.engine.lock();
+                let n = eng.playlist.insert_drop_paths(None, &paths);
+                eng.set_status(format!("Biblioteca: +{n} arquivo(s)"));
+            }
+        });
+    }
+
 
 }
 

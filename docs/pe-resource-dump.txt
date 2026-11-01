@@ -1,36 +1,9 @@
 File: target/x86_64-pc-windows-gnu/release/ondalivre.exe
-Size: 8665600 bytes
-PE machine=0x8664 magic=0x20b
-.rsrc RVA=0x839000 size=37216
-Sections:
-  .text: VA=0x1000 rawsize=4236800
-  .rdata: VA=0x40c000 rawsize=3640832
-  .data: VA=0x785000 rawsize=615936
-  .pdata: VA=0x81c000 rawsize=113152
-  .tls: VA=0x838000 rawsize=512
-  .rsrc: VA=0x839000 rawsize=37376
-  .reloc: VA=0x843000 rawsize=19968
-DIR ICON
-  DIR 1
-    DATA lang=1033 size=442
-  DIR 2
-    DATA lang=1033 size=1287
-  DIR 3
-    DATA lang=1033 size=1487
-  DIR 4
-    DATA lang=1033 size=32745
-DIR GROUP_ICON
-  DIR 1
-    DATA lang=1033 size=62
-DIR VERSION
-  DIR 1
-    DATA lang=1033 size=796
-    ProductName= 'OndaLivre'
-    CompanyName= 'Rodrigo Miquilino'
-    FileDescription= 'OndaLivre - automacao de radio portatil (Fluent UI)'
-    FileVersion= '1.0.0'
-    ProductVersion= '1.0.0'
-    OriginalFilename= 'ondalivre.exe'
-    InternalName= 'ondalivre'
-    LegalCopyright= 'Copyright (c) Rodrigo Miquilino'
-OK: VERSIONINFO + ICON + GROUP_ICON present
+Size: 8764928 bytes
+PE magic=0x20b subsystem=2 (2=GUI)
+U16 OndaLivre: True
+U16 Rodrigo Miquilino: True
+U16 ProductName: True
+U16 CompanyName: True
+U16 FileDescription: True
+U16 1.0.0: True

@@ -68,10 +68,21 @@ jobs:
           parameters: |
             version: ${{ toJSON(steps.ver.outputs.version) }}
 
-      - name: Publish signed exe to GitHub Release
+      - name: Hash signed exe (SHA-256)
+        shell: pwsh
+        run: |
+          $exe = "signed/ondalivre.exe"
+          if (-not (Test-Path $exe)) { throw "signed exe missing" }
+          $hash = (Get-FileHash -Algorithm SHA256 -Path $exe).Hash.ToLower()
+          Set-Content -Path "signed/ondalivre.exe.sha256" -Value "$hash  ondalivre.exe" -NoNewline
+          Write-Host "SHA256=$hash"
+
+      - name: Publish signed exe + sha256 to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: signed/ondalivre.exe
+          files: |
+            signed/ondalivre.exe
+            signed/ondalivre.exe.sha256
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

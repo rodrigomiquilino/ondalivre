@@ -25,8 +25,28 @@ fn main() -> eframe::Result<()> {
         .position(|a| a == "--load")
         .and_then(|i| args.get(i + 1))
         .cloned();
+    ondalivre::update::cleanup_old_backup();
     let engine = Engine::new().expect("falha ao iniciar engine de áudio");
     let shared: SharedEngine = Arc::new(Mutex::new(engine));
+    if let Some(st) = ondalivre::update::take_restart_state() {
+        let mut eng = shared.lock();
+        eng.config.volume = st.volume;
+        eng.player.set_volume(st.volume);
+        if let Some(pl) = st.playlist {
+            if eng.playlist.load_list_file(&pl).is_ok() {
+                if st.cursor < eng.playlist.items.len() {
+                    eng.playlist.cursor = st.cursor;
+                }
+                if st.was_playing {
+                    eng.play();
+                }
+                eng.set_status(format!(
+                    "Reiniciado após atualização (lista restaurada, cursor {})",
+                    st.cursor
+                ));
+            }
+        }
+    }
     if let Some(path) = load {
         let mut eng = shared.lock();
         if let Err(e) = eng.playlist.load_list_file(std::path::Path::new(&path)) {

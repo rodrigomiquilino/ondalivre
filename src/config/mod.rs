@@ -67,6 +67,19 @@ pub struct AppConfig {
     pub auto_delete_expired_events: bool,
     #[serde(default = "default_sat_gain")]
     pub satellite_mix_gain: f32,
+    /// Pasta Time/ (clips HRS/MIN). Vazio = ao lado do executavel.
+    #[serde(default)]
+    pub time_folder: Option<String>,
+    #[serde(default)]
+    pub temperature_folder: Option<String>,
+    #[serde(default)]
+    pub humidity_folder: Option<String>,
+    /// Verificar atualizacoes no GitHub Releases ao iniciar.
+    #[serde(default = "default_true")]
+    pub check_updates: bool,
+    /// Intervalo em horas entre re-checks em background (ETag). Padrao 6.
+    #[serde(default = "default_update_hours")]
+    pub update_check_hours: f64,
 }
 
 fn default_sat_gain() -> f32 { 0.8 }
@@ -77,6 +90,7 @@ fn default_temp_unit() -> String { "C".into() }
 
 
 fn default_true() -> bool { true }
+fn default_update_hours() -> f64 { 6.0 }
 fn default_end_level() -> f32 { 0.08 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -129,6 +143,11 @@ impl Default for AppConfig {
             show_song_numbers: true,
             auto_delete_expired_events: true,
             satellite_mix_gain: 0.8,
+            time_folder: None,
+            temperature_folder: None,
+            humidity_folder: None,
+            check_updates: true,
+            update_check_hours: 6.0,
         }
     }
 }
@@ -172,13 +191,40 @@ pub fn beside_exe(name: &str) -> PathBuf {
 }
 
 pub fn resolve_data_dir(name: &str) -> PathBuf {
+    resolve_data_dir_with(name, None)
+}
+
+/// Resolve Time/Temperature/Humidity: override (config) > pasta ao lado do exe > testdata (dev).
+pub fn resolve_data_dir_with(name: &str, override_path: Option<&str>) -> PathBuf {
+    // Pasta explícita na config sempre vence (mesmo ausente → erro claro em Anunciar hora).
+    if let Some(p) = override_path {
+        if !p.trim().is_empty() {
+            return PathBuf::from(p);
+        }
+    }
     let next = beside_exe(name);
-    if next.exists() {
+    if next.is_dir() {
         return next;
     }
-    let dev = Path::new("testdata").join(name);
-    if dev.exists() {
+    // Dev only: never prefer CWD over exe for end users who only have the .exe.
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let dev = cwd.join("testdata").join(name);
+    if dev.is_dir() {
         return dev;
     }
+    let cwd_named = cwd.join(name);
+    if cwd_named.is_dir() {
+        return cwd_named;
+    }
     next
+}
+
+pub fn data_dir_for(cfg: &AppConfig, kind: &str) -> PathBuf {
+    let ov = match kind {
+        "Time" => cfg.time_folder.as_deref(),
+        "Temperature" => cfg.temperature_folder.as_deref(),
+        "Humidity" => cfg.humidity_folder.as_deref(),
+        _ => None,
+    };
+    resolve_data_dir_with(kind, ov)
 }

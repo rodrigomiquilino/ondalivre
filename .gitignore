@@ -37,3 +37,12 @@ secrets/
 # Packaged archives (rebuild from source)
 /dist/*.tar.gz
 /dist/*.zip
+
+# Runtime state
+dist/windows/now_playing.txt
+dist/windows/playlog.csv
+dist/windows/jingles.json
+update-cache.json
+restart-state*.json
+*.old
+*.dll
