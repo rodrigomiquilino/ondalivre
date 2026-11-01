@@ -1,6 +1,6 @@
-# Build Windows MSVC exe, submit to SignPath, publish signed artifact on tag.
-# Secrets: SIGNPATH_API_TOKEN
-# Vars:    ORGANIZATION_ID, PROJECT_SLUG, SIGNING_POLICY_SLUG
+# Build Windows MSVC exe; SignPath when SIGNPATH_API_TOKEN is set; else publish unsigned.
+# Secrets: SIGNPATH_API_TOKEN (optional)
+# Vars:    ORGANIZATION_ID, PROJECT_SLUG, SIGNING_POLICY_SLUG (needed only when signing)
 # Optional var: ARTIFACT_CONFIGURATION_SLUG (defaults to "default")
 name: release
 
@@ -16,6 +16,8 @@ permissions:
 jobs:
   windows:
     runs-on: windows-latest
+    env:
+      SIGNPATH_API_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -38,6 +40,7 @@ jobs:
 
       - name: Upload unsigned artifact
         id: upload-unsigned
+        if: env.SIGNPATH_API_TOKEN != ''
         uses: actions/upload-artifact@v4
         with:
           name: ondalivre-windows-unsigned
@@ -46,6 +49,7 @@ jobs:
 
       - name: Resolve version for SignPath metadata
         id: ver
+        if: env.SIGNPATH_API_TOKEN != ''
         shell: pwsh
         run: |
           $tag = "${{ github.ref_name }}"
@@ -55,6 +59,7 @@ jobs:
 
       - name: Submit SignPath signing request
         id: sign
+        if: env.SIGNPATH_API_TOKEN != ''
         uses: signpath/github-action-submit-signing-request@v3
         with:
           api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
@@ -68,21 +73,54 @@ jobs:
           parameters: |
             version: ${{ toJSON(steps.ver.outputs.version) }}
 
-      - name: Hash signed exe (SHA-256)
+      - name: Stage publish folder (signed or unsigned)
         shell: pwsh
         run: |
-          $exe = "signed/ondalivre.exe"
-          if (-not (Test-Path $exe)) { throw "signed exe missing" }
+          New-Item -ItemType Directory -Force -Path publish | Out-Null
+          if ($env:SIGNPATH_API_TOKEN -and (Test-Path "signed/ondalivre.exe")) {
+            Copy-Item -Force signed/ondalivre.exe publish/ondalivre.exe
+            Write-Host "Publishing SIGNED build"
+          } else {
+            Copy-Item -Force unsigned/ondalivre.exe publish/ondalivre.exe
+            Write-Host "Publishing UNSIGNED MSVC build (SIGNPATH_API_TOKEN not set)"
+          }
+          $exe = "publish/ondalivre.exe"
+          if (-not (Test-Path $exe)) { throw "publish exe missing" }
           $hash = (Get-FileHash -Algorithm SHA256 -Path $exe).Hash.ToLower()
-          Set-Content -Path "signed/ondalivre.exe.sha256" -Value "$hash  ondalivre.exe" -NoNewline
+          Set-Content -Path "publish/ondalivre.exe.sha256" -Value "$hash  ondalivre.exe" -NoNewline
           Write-Host "SHA256=$hash"
+          Get-Item $exe | Format-List Name, Length
 
-      - name: Publish signed exe + sha256 to GitHub Release
+      - name: Publish exe + sha256 to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            signed/ondalivre.exe
-            signed/ondalivre.exe.sha256
-          generate_release_notes: true
+            publish/ondalivre.exe
+            publish/ondalivre.exe.sha256
+          name: OndaLivre ${{ github.ref_name }}
+          body: |
+            ## OndaLivre ${{ github.ref_name }}
+
+            Primeiro lançamento público da automação de rádio portátil em Rust (interface Fluent).
+
+            ### O que entrou (fases A–C)
+            - **Fase A:** motor de áudio, playlist (`.lst`/`.m3u`/`.pls`/`.rot`/`.seq`), eventos, jingles/sweepers, fade, log, satélite/AGC/DTMF, exportações.
+            - **Fase B:** endurecimento (pause não bloqueante, Goertzel estável, backpressure do satélite, toast de senha).
+            - **Fase C:** UI Fluent (nav, biblioteca real, sem Dispositivos), carts F1–F12 com `consume_key`, toggle/Esc para parar jingles, Anunciar hora (Time/ + SAPI pt-BR), atualização automática via GitHub Releases (ETag/6h, InfoBar, sha256, troca por rename sem interromper o ar).
+
+            ### Download
+            - `ondalivre.exe` — build MSVC x64 (portátil; config ao lado do exe)
+            - `ondalivre.exe.sha256` — checksum SHA-256
+
+            ### Assinatura
+            **Ainda sem assinatura digital.** O SmartScreen / Windows Defender SmartScreen pode avisar na primeira execução — isso é esperado neste lançamento. A assinatura Authenticode (SignPath) será ligada quando o segredo `SIGNPATH_API_TOKEN` estiver configurado.
+
+            ### Verificação
+            ```
+            certutil -hashfile ondalivre.exe SHA256
+            ```
+            Compare com o conteúdo de `ondalivre.exe.sha256`.
+          draft: false
+          prerelease: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
