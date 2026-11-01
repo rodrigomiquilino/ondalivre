@@ -97,6 +97,7 @@ pub struct OndaApp {
     pub lib_entries: Vec<LibEntry>,
     /// Sessão pendente de retomada (InfoBar discreta).
     pub session_offer: Option<crate::session::SessionSnapshot>,
+    pub session_offer_at: Option<std::time::Instant>,
     session_autosave: crate::session::AutosaveClock,
     /// Índice sendo editado no painel Cue/fade (pode diferir de selected).
     pub track_edit_idx: Option<usize>,
@@ -174,6 +175,7 @@ impl OndaApp {
             lib_filter: String::new(),
             lib_entries: Vec::new(),
             session_offer: None,
+            session_offer_at: None,
             session_autosave: crate::session::AutosaveClock::default(),
             track_edit_idx: None,
         };
@@ -919,27 +921,15 @@ impl OndaApp {
             .resizable(false)
             .frame(nav_frame(dark))
             .show(ctx, |ui| {
-                let station = self.engine.lock().config.station_name.clone();
-                let bottom_h = 72.0_f32;
-                let full = ui.available_rect_before_wrap();
-                let top_max = egui::pos2(full.right(), (full.bottom() - bottom_h).max(full.top() + 40.0));
-                let top_rect = egui::Rect::from_min_max(full.min, top_max);
-                let bot_rect = egui::Rect::from_min_max(
-                    egui::pos2(full.left(), top_rect.bottom()),
-                    full.max,
-                );
-
-                let mut top_ui = ui.new_child(
-                    egui::UiBuilder::new()
-                        .id_salt("nav_top")
-                        .max_rect(top_rect)
-                        .layout(egui::Layout::top_down(egui::Align::Min)),
-                );
-                top_ui.set_clip_rect(top_rect);
+                let (station, classic) = {
+                    let eng = self.engine.lock();
+                    (eng.config.station_name.clone(), eng.config.show_classic_menu)
+                };
+                // Entire sidebar scrolls so Estação is never clipped at small heights.
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .id_salt("nav_scroll")
-                    .show(&mut top_ui, |ui| {
+                    .show(ui, |ui| {
                         ui.add_space(SPACE_2);
                         ui.label(
                             RichText::new("Operação")
@@ -975,71 +965,70 @@ impl OndaApp {
                             }
                             ui.add_space(2.0);
                         }
+                        // Classic menu already covers Cue/Players/Sobre — avoid duplicate nav.
+                        if !classic {
+                            ui.add_space(12.0);
+                            ui.separator();
+                            ui.label(
+                                RichText::new("Ferramentas")
+                                    .font(typo::caption())
+                                    .color(secondary_color(dark)),
+                            );
+                            ui.add_space(4.0);
+                            if self
+                                .nav_icon_btn(ui, "headphones", "Cue / pré-escuta", false)
+                                .clicked()
+                            {
+                                self.windows.cue = true;
+                            }
+                            if self
+                                .nav_icon_btn(ui, "speaker", "Players auxiliares", false)
+                                .clicked()
+                            {
+                                self.windows.aux = true;
+                            }
+                            if self.nav_icon_btn(ui, "info", "Sobre", false).clicked() {
+                                self.windows.about = true;
+                            }
+                            if self
+                                .nav_icon_btn(ui, "document", "Verificar atualizações", false)
+                                .clicked()
+                            {
+                                self.start_update_check(true);
+                            }
+                        }
                         ui.add_space(12.0);
                         ui.separator();
+                        ui.add_space(4.0);
                         ui.label(
-                            RichText::new("Ferramentas")
+                            RichText::new("Estação")
                                 .font(typo::caption())
                                 .color(secondary_color(dark)),
                         );
-                        ui.add_space(4.0);
-                        if self.nav_icon_btn(ui, "headphones", "Cue / pré-escuta", false).clicked() {
-                            self.windows.cue = true;
-                        }
-                        if self.nav_icon_btn(ui, "speaker", "Players auxiliares", false).clicked() {
-                            self.windows.aux = true;
-                        }
-                        if self.nav_icon_btn(ui, "info", "Sobre", false).clicked() {
-                            self.windows.about = true;
-                        }
-                        if self
-                            .nav_icon_btn(ui, "document", "Verificar atualizações", false)
-                            .clicked()
-                        {
-                            self.start_update_check(true);
-                        }
-                        ui.add_space(8.0);
+                        let name = if station.is_empty() {
+                            "—"
+                        } else {
+                            station.as_str()
+                        };
+                        ui.label(
+                            RichText::new(name)
+                                .size(13.0)
+                                .strong()
+                                .color(if dark {
+                                    Color32::from_gray(210)
+                                } else {
+                                    Color32::from_gray(40)
+                                }),
+                        );
+                        ui.add_space(10.0);
                     });
-
-                let mut bot_ui = ui.new_child(
-                    egui::UiBuilder::new()
-                        .id_salt("nav_station")
-                        .max_rect(bot_rect)
-                        .layout(egui::Layout::left_to_right(egui::Align::Center)),
-                );
-                bot_ui.set_clip_rect(bot_rect);
-                bot_ui.vertical(|ui| {
-                    ui.add_space(2.0);
-                    ui.separator();
-                    ui.add_space(4.0);
-                    ui.label(
-                        RichText::new("Estação")
-                            .font(typo::caption())
-                            .color(secondary_color(dark)),
-                    );
-                    let name = if station.is_empty() {
-                        "—"
-                    } else {
-                        station.as_str()
-                    };
-                    ui.label(
-                        RichText::new(name)
-                            .size(13.0)
-                            .strong()
-                            .color(if dark {
-                                Color32::from_gray(210)
-                            } else {
-                                Color32::from_gray(40)
-                            }),
-                    );
-                    ui.add_space(6.0);
-                });
             });
     }
 
-
     fn command_bar(&mut self, ctx: &egui::Context, dark: bool) {
-        let compact = self.nav != NavPage::Studio;
+        // Studio: transport lives only near the playlist (Zara adjacency). Other pages keep a compact transport.
+        let studio = self.nav == NavPage::Studio;
+        let compact = !studio;
         let frame = if compact {
             egui::Frame::new()
                 .fill(mica_layer(dark))
@@ -1054,48 +1043,36 @@ impl OndaApp {
         }
         panel.show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = if compact { 6.0 } else { SPACE_2 };
+                    ui.spacing_mut().item_spacing.x = if compact { 6.0 } else { SPACE_3 };
                     let accent = self.accent();
-                    let play_w = if compact { 72.0 } else { 96.0 };
-                    let play_h = if compact { 26.0 } else { CTRL_H };
-                    let play = egui::Button::new(
-                        RichText::new(if compact { " Play" } else { "  Play" })
-                            .color(Color32::from_rgb(12, 40, 18))
-                            .strong()
-                            .size(if compact { 12.0 } else { 14.0 }),
-                    )
-                    .fill(Color32::from_rgb(0x6C, 0xC0, 0x6C))
-                    .corner_radius(egui::CornerRadius::same(RADIUS_CTRL));
-                    let play_r = ui.add_sized([play_w, play_h], play);
-                    if !compact {
-                        if let Some(tex) = self.icons.as_ref().and_then(|i| i.get("play")) {
-                            let r = play_r.rect;
-                            egui::Image::new(tex)
-                                .fit_to_exact_size(egui::vec2(16.0, 16.0))
-                                .tint(Color32::from_rgb(12, 40, 18))
-                                .paint_at(
-                                    ui,
-                                    egui::Rect::from_min_size(
-                                        egui::pos2(r.left() + 12.0, r.center().y - 8.0),
-                                        egui::vec2(16.0, 16.0),
-                                    ),
-                                );
+                    if compact {
+                        let play = egui::Button::new(
+                            RichText::new(" Play")
+                                .color(Color32::from_rgb(12, 40, 18))
+                                .strong()
+                                .size(12.0),
+                        )
+                        .fill(Color32::from_rgb(0x6C, 0xC0, 0x6C))
+                        .corner_radius(egui::CornerRadius::same(RADIUS_CTRL));
+                        if ui.add_sized([72.0, 26.0], play).clicked() {
+                            self.engine.lock().play();
                         }
-                    }
-                    if play_r.clicked() {
-                        self.engine.lock().play();
-                    }
-                    if subtle_button(ui, "Stop", dark)
-                        .on_hover_text("Para a playlist (S no Zara). Jingles: re-clique o cart ou Esc.")
-                        .clicked()
-                    {
-                        self.engine.lock().stop();
-                    }
-                    if subtle_button(ui, "Próximo", dark).clicked() {
-                        self.engine.lock().next();
-                    }
-                    if !compact {
+                        if subtle_button(ui, "Stop", dark)
+                            .on_hover_text("Para a playlist (S). Jingles: Esc.")
+                            .clicked()
+                        {
+                            self.engine.lock().stop();
+                        }
+                        if subtle_button(ui, "Próximo", dark).clicked() {
+                            self.engine.lock().next();
+                        }
                         ui.separator();
+                        let mut eng = self.engine.lock();
+                        ui.label(RichText::new("Vol").font(typo::caption()).color(secondary_color(dark)));
+                        let _ = fluent_slider(ui, &mut eng.config.volume, 0.0..=1.0, accent, dark);
+                        eng.player.set_volume(eng.config.volume);
+                    } else {
+                        // Studio command bar: mode + volume only (no duplicate transport).
                         {
                             let mut eng = self.engine.lock();
                             let opts = [
@@ -1106,6 +1083,7 @@ impl OndaApp {
                                 (PlaylistMode::Random, mode_label(PlaylistMode::Random)),
                             ];
                             let _ = fluent_combo(ui, "mode", &mut eng.playlist.mode, &opts, dark, accent);
+                            ui.add_space(SPACE_2);
                             ui.label(RichText::new("Vol").font(typo::caption()).color(secondary_color(dark)));
                             let _ = fluent_slider(ui, &mut eng.config.volume, 0.0..=1.0, accent, dark);
                             ui.label(
@@ -1115,14 +1093,9 @@ impl OndaApp {
                             );
                             eng.player.set_volume(eng.config.volume);
                         }
-                    } else {
-                        // Compact: volume only, no mode combo clutter.
-                        let mut eng = self.engine.lock();
-                        ui.label(RichText::new("Vol").font(typo::caption()).color(secondary_color(dark)));
-                        let _ = fluent_slider(ui, &mut eng.config.volume, 0.0..=1.0, accent, dark);
-                        eng.player.set_volume(eng.config.volume);
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        // Clock far right; ≥56px clear gap before Anunciar hora.
                         let now = Local::now().format("%H:%M:%S").to_string();
                         ui.label(
                             RichText::new(now)
@@ -1130,13 +1103,16 @@ impl OndaApp {
                                 .color(accent)
                                 .strong(),
                         );
-                        if !compact {
+                        if studio {
+                            // Fixed-width spacer so clock never crowds Anunciar hora.
+                            ui.allocate_exact_size(egui::vec2(96.0, 1.0), egui::Sense::hover());
                             if subtle_button(ui, "Anunciar hora", dark)
                                 .on_hover_text("Toca os audios de hora (atalho operacional)")
                                 .clicked()
                             {
                                 self.engine.lock().announce_time();
                             }
+                            ui.add_space(SPACE_3);
                             if subtle_button(ui, "Abrir lista", dark)
                                 .on_hover_text("Abrir arquivo .lst / .m3u (Ctrl+O)")
                                 .clicked()
@@ -1214,7 +1190,15 @@ clip={:?}
         }
         let _ = ui.allocate_exact_size(available.size(), egui::Sense::hover());
 
-        let top_h = 148.0_f32;
+        // ZaraRadio proportions (Fluent): top strip sized to fit counters + full-width VU;
+        // playlist ~70% left; right stacks Agenda (scrollable) + compact carts.
+        // Content budget (margins 24 + row≈88 + gap 8 + VU≈98) ≈ 218 → clamp 200–236.
+        // Short windows: smaller top so Agenda empty-state + ≥2 jingle rows stay visible.
+        let top_h = if content.height() < 560.0 {
+            (content.height() * 0.34).clamp(210.0, 244.0)
+        } else {
+            (content.height() * 0.40).clamp(260.0, 320.0)
+        };
         let gap_y = 8.0_f32;
         let gap = 12.0_f32;
         let top_rect = egui::Rect::from_min_size(content.min, egui::vec2(content_w, top_h));
@@ -1223,19 +1207,35 @@ clip={:?}
             egui::Rect::from_min_max(egui::pos2(content.left(), body_top), content.max);
         let body_h = body_rect.height().max(120.0);
         let usable_w = body_rect.width().max(1.0);
-        let inner = (usable_w - gap * 2.0).max(1.0);
-        let left_w = (inner * 0.45).floor();
-        let mid_w = (inner * 0.22).floor();
-        let right_w = (inner - left_w - mid_w).max(1.0);
+        let inner = (usable_w - gap).max(1.0);
+        let left_w = (inner * 0.70).floor();
+        let right_w = (inner - left_w).max(1.0);
         let left_rect =
             egui::Rect::from_min_size(body_rect.min, egui::vec2(left_w, body_h));
-        let mid_rect = egui::Rect::from_min_size(
-            egui::pos2(left_rect.right() + gap, body_rect.top()),
-            egui::vec2(mid_w, body_h),
-        );
         let right_rect = egui::Rect::from_min_size(
-            egui::pos2(mid_rect.right() + gap, body_rect.top()),
+            egui::pos2(left_rect.right() + gap, body_rect.top()),
             egui::vec2(right_w, body_h),
+        );
+        // Empty agenda → compact strip; jingles must fit 4×3 carts (~40px) + pager.
+        let right_gap = 8.0_f32;
+        let agenda_empty = {
+            let eng = self.engine.lock();
+            eng.events.upcoming(120).is_empty()
+        };
+        // 4 rows × 40 + 3 gaps × 8 + header~36 + pager~28 + margins ≈ 260.
+        let jingles_min = if body_h >= 360.0 { 280.0 } else { 220.0 };
+        let events_h = if agenda_empty {
+            // Header + checkbox only — no empty pad (jingles need pager room).
+            78.0_f32
+        } else {
+            (body_h - right_gap - jingles_min).clamp(140.0, 200.0)
+        };
+        let jingles_h = (body_h - right_gap - events_h).max(jingles_min);
+        let events_rect =
+            egui::Rect::from_min_size(right_rect.min, egui::vec2(right_w, events_h));
+        let jingles_rect = egui::Rect::from_min_size(
+            egui::pos2(right_rect.left(), events_rect.bottom() + right_gap),
+            egui::vec2(right_w, jingles_h),
         );
 
         // Helper: paint into an absolute rect without advancing the (already claimed) placer.
@@ -1264,12 +1264,13 @@ clip={:?}
             add(&mut child);
         };
 
-        // --- Top: No ar card ---
+        // --- Top: track + counters (intrinsic) + VU fills remaining card height ---
         paint_at(ui, top_rect, "no_ar_card", &mut |ui| {
                 egui::Frame::new()
                     .inner_margin(egui::Margin::same(SPACE_3 as i8))
                     .show(ui, |ui| {
                     ui.set_width(ui.available_width());
+                    let card_inner_h = ui.available_height();
                     let (now_title, next_title, remaining, elapsed, dur, playing) = {
                         let eng = self.engine.lock();
                         let cursor = eng.playlist.cursor;
@@ -1300,17 +1301,19 @@ clip={:?}
                         (now, next, remaining, elapsed, dur, playing)
                     };
                     let (artist, title) = split_artist_title(&now_title);
-                    let row_w = ui.available_width();
-                    let vu_w = 72.0_f32;
-                    let rem_w = 210.0_f32;
-                    let gap_rv = 32.0_f32;
-                    let left_w = (row_w - vu_w - rem_w - gap_rv - SPACE_2).max(80.0);
-                    ui.horizontal(|ui| {
-                        ui.set_width(row_w);
-                        ui.allocate_ui_with_layout(
-                            egui::vec2(left_w, 100.0),
-                            egui::Layout::top_down(egui::Align::Min),
-                            |ui| {
+
+                    // Header row — top-aligned so counter glyphs aren't centered into a clip edge.
+                    let header_top = ui.cursor().top();
+                    ui.horizontal_top(|ui| {
+                        let rem_txt = remaining
+                            .map(fmt_mmss)
+                            .unwrap_or_else(|| "--:--".into());
+                        let elapsed_txt = fmt_mmss(elapsed);
+                        let counter_block_w = 340.0_f32;
+                        let left_w = (ui.available_width() - counter_block_w - SPACE_3).max(160.0);
+                        ui.scope(|ui| {
+                            ui.set_width(left_w);
+                            ui.vertical(|ui| {
                                 ui.set_max_width(left_w - 4.0);
                                 ui.label(
                                     RichText::new(if playing { "NO AR" } else { "PARADO" })
@@ -1338,7 +1341,6 @@ clip={:?}
                                             .color(secondary_color(dark)),
                                     );
                                 }
-                                ui.add_space(4.0);
                                 ui.horizontal(|ui| {
                                     ui.label(
                                         RichText::new("Próximo")
@@ -1355,83 +1357,101 @@ clip={:?}
                                             }),
                                     );
                                 });
-                            },
-                        );
-                        ui.add_space(SPACE_2);
-                        ui.allocate_ui_with_layout(
-                            egui::vec2(rem_w, 100.0),
-                            egui::Layout::top_down(egui::Align::Max),
-                            |ui| {
-                                ui.set_max_width(rem_w);
-                                ui.label(
-                                    RichText::new("Restante")
-                                        .font(typo::caption())
-                                        .color(secondary_color(dark)),
+                                let prog = match (dur, remaining) {
+                                    (Some(d), Some(r)) if d > 0.1 => 1.0 - (r / d),
+                                    _ => 0.0,
+                                };
+                                let bar_w = ui.available_width().min(left_w - 8.0);
+                                let (rect, _) = ui
+                                    .allocate_exact_size(egui::vec2(bar_w, 6.0), egui::Sense::hover());
+                                ui.painter().rect_filled(
+                                    rect,
+                                    3.0,
+                                    if dark {
+                                        Color32::from_gray(72)
+                                    } else {
+                                        Color32::from_gray(200)
+                                    },
                                 );
-                                let rem_txt = remaining
-                                    .map(fmt_mmss)
-                                    .unwrap_or_else(|| "--:--".into());
-                                ui.add(
-                                    egui::Label::new(
-                                        RichText::new(rem_txt)
-                                            .font(typo::display())
-                                            .color(if dark {
-                                                Color32::WHITE
-                                            } else {
-                                                Color32::from_gray(20)
-                                            }),
-                                    )
-                                    .wrap_mode(egui::TextWrapMode::Extend),
-                                );
-                                ui.label(
-                                    RichText::new(format!("Decorrido {}", fmt_mmss(elapsed)))
-                                        .font(typo::caption())
-                                        .color(secondary_color(dark)),
-                                );
-                            },
-                        );
-                        ui.add_space(gap_rv);
-                        ui.allocate_ui_with_layout(
-                            egui::vec2(vu_w, 100.0),
-                            egui::Layout::top_down(egui::Align::Center),
-                            |ui| {
-                                ui.set_width(vu_w);
-                                ui.label(
-                                    RichText::new("VU")
-                                        .font(typo::caption())
-                                        .color(secondary_color(dark)),
-                                );
-                                draw_vu_lr(ui, &self.vu_ballistics, dark, 96.0);
-                            },
+                                let fill_w = (bar_w * prog.clamp(0.0, 1.0))
+                                    .max(if prog > 0.0 { 3.0 } else { 0.0 });
+                                if fill_w > 0.0 {
+                                    let fill =
+                                        egui::Rect::from_min_size(rect.min, egui::vec2(fill_w, 6.0));
+                                    ui.painter().rect_filled(fill, 3.0, accent);
+                                }
+                            });
+                        });
+                        ui.add_space(SPACE_3);
+                        // Restante = hero clock; Decorrido = secondary.
+                        let rem_secs = remaining.unwrap_or(f32::INFINITY);
+                        let rem_color = if rem_secs < 10.0 {
+                            Color32::from_rgb(0xE8, 0x5A, 0x4F) // red
+                        } else if rem_secs < 20.0 {
+                            Color32::from_rgb(0xF0, 0xC0, 0x4A) // amber
+                        } else if dark {
+                            Color32::WHITE
+                        } else {
+                            Color32::from_gray(20)
+                        };
+                        let deco_color = secondary_color(dark);
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = SPACE_4;
+                            // Restante — dominant
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(200.0, 78.0),
+                                egui::Layout::top_down(egui::Align::Min),
+                                |ui| {
+                                    ui.set_clip_rect(ui.max_rect().expand(2.0));
+                                    ui.label(
+                                        RichText::new("Restante")
+                                            .font(typo::caption())
+                                            .strong()
+                                            .color(secondary_color(dark)),
+                                    );
+                                    ui.label(
+                                        RichText::new(rem_txt.as_str())
+                                            .font(egui::FontId::monospace(52.0))
+                                            .color(rem_color),
+                                    );
+                                },
+                            );
+                            // Decorrido — secondary
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(120.0, 78.0),
+                                egui::Layout::top_down(egui::Align::Min),
+                                |ui| {
+                                    ui.set_clip_rect(ui.max_rect().expand(2.0));
+                                    ui.label(
+                                        RichText::new("Decorrido")
+                                            .font(typo::caption())
+                                            .color(secondary_color(dark)),
+                                    );
+                                    ui.label(
+                                        RichText::new(elapsed_txt.as_str())
+                                            .font(egui::FontId::monospace(22.0))
+                                            .color(deco_color),
+                                    );
+                                },
+                            );
+                        });
+                    });
+                    let header_h = ui.cursor().top() - header_top;
+                    let _ = card_inner_h;
+                    let _ = header_h;
+                    // Pack VU into remaining card height (no spacer that wastes middle).
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new("Nível")
+                                .font(typo::caption())
+                                .color(secondary_color(dark)),
+                        )
+                        .on_hover_text(
+                            "Barras = RMS · traço branco = pico · marcas âmbar = hold. Verde < −18 dB · âmbar −18…−6 · vermelho > −6. Leitura à direita = pico dBFS.",
                         );
                     });
-                    ui.add_space(SPACE_2);
-                    let prog = match (dur, remaining) {
-                        (Some(d), Some(r)) if d > 0.1 => 1.0 - (r / d),
-                        _ => 0.0,
-                    };
-                    let bar_w = ui.available_width();
-                    let (rect, _) =
-                        ui.allocate_exact_size(egui::vec2(bar_w, 8.0), egui::Sense::hover());
-                    ui.painter().rect_filled(
-                        rect,
-                        4.0,
-                        if dark {
-                            Color32::from_gray(72)
-                        } else {
-                            Color32::from_gray(200)
-                        },
-                    );
-                    let fill_w =
-                        (bar_w * prog.clamp(0.0, 1.0)).max(if prog > 0.0 { 4.0 } else { 0.0 });
-                    if fill_w > 0.0 {
-                        let fill = egui::Rect::from_min_size(rect.min, egui::vec2(fill_w, 8.0));
-                        ui.painter().rect_filled(fill, 4.0, accent);
-                    } else {
-                        let tip = egui::Rect::from_min_size(rect.min, egui::vec2(6.0, 8.0));
-                        ui.painter()
-                            .rect_filled(tip, 4.0, accent.gamma_multiply(0.85));
-                    }
+                    let vu_h = ui.available_height().max(1.0);
+                    draw_vu_lr(ui, &self.vu_ballistics, dark, vu_h);
                 });
         });
 
@@ -1969,20 +1989,42 @@ clip={:?}
                         let _ = self.engine.lock().play_playlist_index(i);
                     }
                     ui.add_space(4.0);
+                    // Transport near playlist (Zara bottom-toolbar adjacency).
                     ui.allocate_ui_with_layout(
                         egui::vec2(ui.available_width(), action_h - 4.0),
                         egui::Layout::left_to_right(egui::Align::Center),
                         |ui| {
+                            let play = egui::Button::new(
+                                RichText::new(" Play")
+                                    .color(Color32::from_rgb(12, 40, 18))
+                                    .strong()
+                                    .size(13.0),
+                            )
+                            .fill(Color32::from_rgb(0x6C, 0xC0, 0x6C))
+                            .corner_radius(egui::CornerRadius::same(RADIUS_CTRL));
+                            if ui.add_sized([72.0, 28.0], play).clicked() {
+                                self.engine.lock().play();
+                            }
+                            if subtle_button(ui, "Stop", dark)
+                                .on_hover_text("Para a playlist (S)")
+                                .clicked()
+                            {
+                                self.engine.lock().stop();
+                            }
+                            if subtle_button(ui, "Próximo", dark).clicked() {
+                                self.engine.lock().next();
+                            }
+                            ui.separator();
                             self.playlist_action_bar(ui);
                         },
                     );
                 });
         });
 
-        // --- Agenda: same bottom edge as siblings ---
-        paint_at(ui, mid_rect, "agenda_col", &mut |ui| {
+        // --- Agenda (right column, top) ---
+        paint_at(ui, events_rect, "agenda_col", &mut |ui| {
                 egui::Frame::new()
-                    .inner_margin(egui::Margin::same(SPACE_3 as i8))
+                    .inner_margin(egui::Margin::same(SPACE_2 as i8))
                     .show(ui, |ui| {
                     ui.set_min_size(ui.available_size());
                     ui.set_max_size(ui.available_size());
@@ -2001,17 +2043,15 @@ clip={:?}
                         ui.add_space(4.0);
                         let upcoming = eng.events.upcoming(120);
                         if upcoming.is_empty() {
-                            let icon =
-                                self.icons.as_ref().and_then(|i| i.image("calendar", 32.0));
-                            empty_state(
-                                ui,
-                                dark,
-                                icon,
-                                "Agenda livre",
-                                "Nenhum evento na proxima hora. Editar para agendar.",
+                            ui.label(
+                                RichText::new("Livre · sem eventos (1h)")
+                                    .size(11.0)
+                                    .color(secondary_color(dark)),
                             );
                         } else {
+                            let body_h = ui.available_height().max(48.0);
                             egui::ScrollArea::vertical()
+                                .max_height(body_h)
                                 .auto_shrink([false, false])
                                 .show(ui, |ui| {
                                     for (ri, ev) in upcoming.into_iter().take(16).enumerate() {
@@ -2055,21 +2095,23 @@ clip={:?}
                 });
         });
 
-        // --- Jingles: pad grid sized from column rect ---
-        paint_at(ui, right_rect, "jingles_col", &mut |ui| {
+        // --- Jingles (right column, bottom — compact carts) ---
+        paint_at(ui, jingles_rect, "jingles_col", &mut |ui| {
                 egui::Frame::new()
-                    .inner_margin(egui::Margin::same(SPACE_3 as i8))
+                    .inner_margin(egui::Margin::same(SPACE_2 as i8))
                     .show(ui, |ui| {
                     ui.set_min_size(ui.available_size());
                     ui.set_max_size(ui.available_size());
                     ui.horizontal(|ui| {
                         ui.label(RichText::new("Jingles").font(typo::subtitle()));
+                        let narrow = ui.available_width() < 200.0;
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             ui.add_space(4.0);
                             if subtle_button(ui, "Editar", dark).clicked() {
                                 self.nav = NavPage::Jingles;
                             }
-                            if subtle_button(ui, "Parar jingles", dark)
+                            let stop_lbl = if narrow { "Parar" } else { "Parar jingles" };
+                            if subtle_button(ui, stop_lbl, dark)
                                 .on_hover_text("Esc — para todos os carts (não afeta a playlist)")
                                 .clicked()
                             {
@@ -2077,7 +2119,7 @@ clip={:?}
                             }
                         });
                     });
-                    ui.add_space(SPACE_2);
+                    ui.add_space(4.0);
                     let (names, active, elapsed, jdur, jplaying) = {
                         let eng = self.engine.lock();
                         let names: Vec<String> = eng
@@ -2092,18 +2134,19 @@ clip={:?}
                         let jplaying = eng.jingle_is_playing();
                         (names, active, elapsed, jdur, jplaying)
                     };
+                    // Always show all 12 carts (4×3) + pager. pad_h never exceeds reserved area.
                     let cols = 3usize;
                     let rows_n = 4usize;
-                    let page_row_h = 32.0_f32;
-                    let pad_area_h = (ui.available_height() - page_row_h - SPACE_2).max(1.0);
+                    let page_row_h = 26.0_f32;
+                    let pad_area_h = (ui.available_height() - page_row_h - 4.0).max(1.0);
                     let pad_area_w = ui.available_width().max(1.0);
-                    let cell_gap = SPACE_2;
+                    let cell_gap = 5.0_f32;
                     let pad_w = ((pad_area_w - cell_gap * (cols as f32 - 1.0)) / cols as f32)
                         .floor()
                         .max(1.0);
                     let pad_h = ((pad_area_h - cell_gap * (rows_n as f32 - 1.0)) / rows_n as f32)
                         .floor()
-                        .max(1.0);
+                        .clamp(1.0, 38.0);
                     let tints = [
                         Color32::from_rgb(0x2B, 0x4A, 0x6F),
                         Color32::from_rgb(0x3A, 0x4A, 0x3A),
@@ -2278,7 +2321,7 @@ clip={:?}
                         egui::vec2(pad_area_w, grid_h),
                         egui::Sense::hover(),
                     );
-                    ui.add_space(SPACE_2);
+                    ui.add_space(2.0);
                     ui.horizontal(|ui| {
                         if subtle_button(ui, "◀", dark)
                             .on_hover_text("Page Up")
@@ -3084,6 +3127,34 @@ clip={:?}
                     ui.heading("Fade / detector");
                     ui.add(egui::Slider::new(&mut eng.config.overlap_secs, 0.0..=15.0).text("Overlap (s)"));
                     ui.add(egui::Slider::new(&mut eng.config.fade_secs, 0.1..=8.0).text("Fade (s)"));
+                    {
+                        let track_len = eng
+                            .playlist
+                            .items
+                            .get(eng.playlist.cursor)
+                            .and_then(|i| i.effective_duration())
+                            .or(eng.track_duration);
+                        if let Some(d) = track_len {
+                            let mut clamped = false;
+                            if eng.config.fade_secs > d {
+                                eng.config.fade_secs = d;
+                                clamped = true;
+                            }
+                            if eng.config.overlap_secs > d {
+                                eng.config.overlap_secs = d;
+                                clamped = true;
+                            }
+                            if clamped || eng.config.fade_secs + eng.config.overlap_secs > d {
+                                ui.label(
+                                    RichText::new(format!(
+                                        "Fade/overlap limitados à faixa atual ({d:.1}s). Ajuste por faixa em Cue/fade."
+                                    ))
+                                    .font(typo::caption())
+                                    .color(Color32::from_rgb(0xE8, 0xA8, 0x38)),
+                                );
+                            }
+                        }
+                    }
                     ui.checkbox(&mut eng.config.fade_on_overlap, "Fade no overlap");
                     ui.checkbox(&mut eng.config.fade_on_stop, "Fade no stop");
                     ui.checkbox(&mut eng.config.auto_fade, "Auto-fade (detector de fim)");
@@ -3972,12 +4043,24 @@ clip={:?}
             }
             if crate::session::is_fresh(&snap, std::time::Duration::from_secs(7 * 24 * 3600)) {
                 self.session_offer = Some(snap);
+                self.session_offer_at = Some(std::time::Instant::now());
             }
         }
     }
 
     fn win_session_resume(&mut self, ctx: &egui::Context, dark: bool) {
         if self.session_offer.is_none() {
+            return;
+        }
+        // Slim InfoBar auto-dismisses after ~12s if the operator ignores it.
+        if self
+            .session_offer_at
+            .map(|t| t.elapsed().as_secs_f32() > 12.0)
+            .unwrap_or(false)
+        {
+            crate::session::clear();
+            self.session_offer = None;
+            self.session_offer_at = None;
             return;
         }
         let label = self
@@ -4031,7 +4114,9 @@ clip={:?}
         if ignore {
             crate::session::clear();
             self.session_offer = None;
+            self.session_offer_at = None;
         } else if resume {
+            self.session_offer_at = None;
             if let Some(snap) = self.session_offer.take() {
                 self.apply_session_resume(snap);
             }

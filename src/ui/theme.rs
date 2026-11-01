@@ -288,10 +288,13 @@ pub fn empty_state(ui: &mut egui::Ui, dark: bool, icon: Option<egui::Image<'_>>,
                 .font(typo::body_strong())
                 .color(if dark { Color32::from_gray(230) } else { Color32::from_gray(40) }),
         );
-        ui.label(
-            egui::RichText::new(hint)
-                .font(typo::caption())
-                .color(secondary_color(dark)),
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new(hint)
+                    .font(typo::caption())
+                    .color(secondary_color(dark)),
+            )
+            .wrap(),
         );
         ui.add_space(SPACE_2);
     });
@@ -470,7 +473,8 @@ pub fn fluent_combo<T: PartialEq + Copy>(
     changed
 }
 
-/// VU vertical L/R em dBFS (−60…0), segmentos G/Y/R, peak hold e clip.
+/// VU estéreo horizontal em dBFS (−60…0): barras largas G/Y/R, pico, hold, escala, readout.
+/// `height` = altura total do bloco (escala + E + D); barras engordam para preencher.
 pub fn draw_vu_lr(
     ui: &mut egui::Ui,
     meter: &crate::audio::MeterBallistics,
@@ -478,109 +482,186 @@ pub fn draw_vu_lr(
     height: f32,
 ) {
     use crate::audio::{dbfs_to_meter01, linear_to_dbfs};
-    let w = 18.0;
-    let gap = 14.0;
-    let tick_w = 28.0;
-    let (rect, _) = ui.allocate_exact_size(
-        egui::vec2(w * 2.0 + gap + tick_w + 8.0, height),
-        egui::Sense::hover(),
-    );
+    let width = ui.available_width().max(160.0);
+    let gap = 10.0;
+    let scale_h = 18.0;
+    let read_w = 58.0;
+    let ch_label_w = 20.0;
+    // Pack top→bottom. total_h never exceeds remaining rect (avoids D-bar clip).
+    let rem = ui.available_height().max(1.0);
+    let avail = height.min(rem).max(72.0).min(rem);
+    let overhead = scale_h + 4.0 + gap + 2.0;
+    let bar_h = ((avail - overhead) / 2.0).clamp(22.0, 72.0);
+    let total_h = (overhead + bar_h * 2.0).min(rem);
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, total_h), egui::Sense::hover());
     let painter = ui.painter();
+
     let green = Color32::from_rgb(0x6C, 0xC0, 0x6C);
     let yellow = Color32::from_rgb(0xF0, 0xC0, 0x4A);
     let red = Color32::from_rgb(0xE8, 0x5A, 0x4F);
-    let track = if dark {
-        Color32::from_gray(36)
+    let peak_col = if dark {
+        Color32::from_rgb(0xF2, 0xF2, 0xF2)
     } else {
-        Color32::from_gray(220)
+        Color32::from_gray(20)
     };
-    let ticks = [-60.0_f32, -40.0, -20.0, -10.0, -6.0, -3.0, 0.0];
-    let bar_top = rect.top() + 4.0;
-    let bar_h = height - 22.0;
-    let db_y = |db: f32| bar_top + bar_h * (1.0 - dbfs_to_meter01(db));
+    let track = if dark {
+        Color32::from_gray(42)
+    } else {
+        Color32::from_gray(225)
+    };
+    let sec = secondary_color(dark);
 
-    // Tick marks (right of R bar)
-    let tick_x = rect.left() + 6.0 + 2.0 * (w + gap) - gap + 4.0;
-    for db in ticks {
-        let y = db_y(db);
-        painter.line_segment(
-            [egui::pos2(tick_x, y), egui::pos2(tick_x + 6.0, y)],
-            Stroke::new(1.0, secondary_color(dark)),
-        );
-        if db == 0.0 || db == -6.0 || db == -20.0 || db == -40.0 || db == -60.0 {
-            painter.text(
-                egui::pos2(tick_x + 8.0, y),
-                egui::Align2::LEFT_CENTER,
-                format!("{db:.0}"),
-                FontId::proportional(9.0),
-                secondary_color(dark),
-            );
+    let bar_left = rect.left() + ch_label_w;
+    let bar_right = rect.right() - read_w;
+    let bar_w = (bar_right - bar_left).max(80.0);
+    let db_x = |db: f32| bar_left + bar_w * dbfs_to_meter01(db);
+
+    let preferred = [-60.0_f32, -40.0, -20.0, -10.0, -6.0, 0.0];
+    let min_gap = 40.0_f32;
+    let mut final_labels: Vec<f32> = Vec::new();
+    for &db in &preferred {
+        let x = db_x(db);
+        if final_labels
+            .last()
+            .map(|&prev| (x - db_x(prev)).abs() >= min_gap)
+            .unwrap_or(true)
+        {
+            final_labels.push(db);
         }
     }
+    if final_labels.last().map(|d| (*d - 0.0).abs() > 0.01).unwrap_or(true) {
+        while let Some(&last) = final_labels.last() {
+            if (db_x(0.0) - db_x(last)).abs() < min_gap {
+                final_labels.pop();
+            } else {
+                break;
+            }
+        }
+        final_labels.push(0.0);
+    }
 
-    for (i, label) in [(0usize, "L"), (1, "R")] {
-        let x = rect.left() + 6.0 + i as f32 * (w + gap);
-        let bar = egui::Rect::from_min_size(egui::pos2(x, bar_top), egui::vec2(w, bar_h));
-        painter.rect_filled(bar, 3.0, track);
-
-        // Segment zones: green < -18, yellow -18..-6, red > -6 (in fill space)
-        let y_m18 = db_y(-18.0);
-        let y_m6 = db_y(-6.0);
-        let seg_g = egui::Rect::from_min_max(egui::pos2(bar.left(), y_m18), bar.max);
-        let seg_y = egui::Rect::from_min_max(egui::pos2(bar.left(), y_m6), egui::pos2(bar.right(), y_m18));
-        let seg_r = egui::Rect::from_min_max(bar.min, egui::pos2(bar.right(), y_m6));
-        let dim = |c: Color32| Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), 36);
-        painter.rect_filled(seg_g, 0.0, dim(green));
-        painter.rect_filled(seg_y, 0.0, dim(yellow));
-        painter.rect_filled(seg_r, 0.0, dim(red));
-
-        let (peak, hold, clip) = if i == 0 {
-            (meter.peak_l, meter.hold_l, meter.clip_l)
-        } else {
-            (meter.peak_r, meter.hold_r, meter.clip_r)
-        };
-        let lv = dbfs_to_meter01(linear_to_dbfs(peak));
-        let fill_h = bar.height() * lv;
-        let fill = egui::Rect::from_min_max(
-            egui::pos2(bar.left(), bar.bottom() - fill_h),
-            bar.max,
+    let scale_y = rect.top() + 2.0;
+    for &db in &final_labels {
+        let x = db_x(db);
+        painter.line_segment(
+            [egui::pos2(x, scale_y + scale_h - 3.0), egui::pos2(x, scale_y + scale_h)],
+            Stroke::new(1.0, sec),
         );
-        let paint_seg = |seg: egui::Rect, col: Color32| {
-            let inter = seg.intersect(fill);
-            if inter.height() > 0.4 && inter.width() > 0.4 {
-                painter.rect_filled(inter, 0.0, col);
+        let txt = if db == 0.0 {
+            "0".to_owned()
+        } else {
+            format!("{db:.0}")
+        };
+        painter.text(
+            egui::pos2(x, scale_y),
+            egui::Align2::CENTER_TOP,
+            txt,
+            FontId::proportional(10.0),
+            sec,
+        );
+    }
+
+    for (i, ch) in [(0usize, "E"), (1, "D")] {
+        let y0 = rect.top() + scale_h + 4.0 + i as f32 * (bar_h + gap);
+        let bar = egui::Rect::from_min_size(egui::pos2(bar_left, y0), egui::vec2(bar_w, bar_h));
+        painter.rect_filled(bar, 4.0, track);
+
+        let x_m18 = db_x(-18.0);
+        let x_m6 = db_x(-6.0);
+        // Unlit stays the neutral track (painted above). Only hairline zone markers —
+        // never a colored wash that reads as signal.
+        let mark = Color32::from_rgba_unmultiplied(255, 255, 255, 18);
+        for x in [x_m18, x_m6] {
+            if x > bar.left() + 1.0 && x < bar.right() - 1.0 {
+                painter.line_segment(
+                    [egui::pos2(x, bar.top()), egui::pos2(x, bar.bottom())],
+                    Stroke::new(1.0_f32, mark),
+                );
+            }
+        }
+
+        let (peak, rms, hold, clip) = if i == 0 {
+            (meter.peak_l, meter.rms_l, meter.hold_l, meter.clip_l)
+        } else {
+            (meter.peak_r, meter.rms_r, meter.hold_r, meter.clip_r)
+        };
+        let rms_db = linear_to_dbfs(rms);
+        let peak_db = linear_to_dbfs(peak);
+        let hold_db = linear_to_dbfs(hold);
+        let fill_r = db_x(rms_db).clamp(bar.left(), bar.right());
+        let fill = egui::Rect::from_min_max(
+            egui::pos2(bar.left(), bar.top() + 1.0),
+            egui::pos2(fill_r, bar.bottom() - 1.0),
+        );
+        let paint_zone = |z0: f32, z1: f32, col: Color32| {
+            let a = z0.max(fill.left());
+            let b = z1.min(fill.right());
+            if b - a > 0.5 {
+                painter.rect_filled(
+                    egui::Rect::from_min_max(
+                        egui::pos2(a, fill.top()),
+                        egui::pos2(b, fill.bottom()),
+                    ),
+                    0.0,
+                    col,
+                );
             }
         };
-        paint_seg(seg_g, green);
-        paint_seg(seg_y, yellow);
-        paint_seg(seg_r, red);
+        paint_zone(bar.left(), x_m18, green);
+        paint_zone(x_m18, x_m6, yellow);
+        paint_zone(x_m6, bar.right(), red);
 
-        // Peak hold line
-        let hy = db_y(linear_to_dbfs(hold));
-        if hold > 1e-6 {
+        if peak > 1e-6 {
+            let px = db_x(peak_db).clamp(bar.left(), bar.right());
             painter.line_segment(
-                [egui::pos2(bar.left(), hy), egui::pos2(bar.right(), hy)],
-                Stroke::new(1.5, Color32::from_gray(if dark { 230 } else { 30 })),
+                [egui::pos2(px, bar.top() + 1.0), egui::pos2(px, bar.bottom() - 1.0)],
+                Stroke::new(2.0, peak_col),
             );
         }
-        // Clip LED
-        if clip {
-            let led = egui::Rect::from_center_size(
-                egui::pos2(bar.center().x, bar.top() - 1.0),
-                egui::vec2(w - 2.0, 4.0),
+        if hold > 1e-6 {
+            let hx = db_x(hold_db).clamp(bar.left(), bar.right());
+            painter.line_segment(
+                [egui::pos2(hx, bar.top()), egui::pos2(hx, bar.top() + 5.0)],
+                Stroke::new(1.5, Color32::from_rgb(0xFF, 0xD0, 0x60)),
             );
-            painter.rect_filled(led, 1.0, red);
+            painter.line_segment(
+                [egui::pos2(hx, bar.bottom() - 5.0), egui::pos2(hx, bar.bottom())],
+                Stroke::new(1.5, Color32::from_rgb(0xFF, 0xD0, 0x60)),
+            );
+        }
+        if clip {
+            painter.rect_filled(
+                egui::Rect::from_min_size(
+                    egui::pos2(bar.right() - 6.0, bar.top() + 2.0),
+                    egui::vec2(4.0, bar_h - 4.0),
+                ),
+                1.0,
+                red,
+            );
         }
 
         painter.text(
-            egui::pos2(bar.center().x, rect.bottom() - 1.0),
-            egui::Align2::CENTER_BOTTOM,
-            label,
-            FontId::proportional(11.0),
-            secondary_color(dark),
+            egui::pos2(rect.left() + 2.0, bar.center().y),
+            egui::Align2::LEFT_CENTER,
+            ch,
+            FontId::proportional(12.0),
+            sec,
+        );
+        let peak_txt = if peak < 1e-6 {
+            "−∞".to_owned()
+        } else {
+            format!("{peak_db:.0} dB")
+        };
+        painter.text(
+            egui::pos2(rect.right() - 2.0, bar.center().y),
+            egui::Align2::RIGHT_CENTER,
+            peak_txt,
+            FontId::proportional(12.0),
+            if clip { red } else { peak_col },
         );
     }
 }
+
 
 /// Botao de caption Windows Fluent: 46x32 (min / max / close).
 pub enum CaptionKind {
