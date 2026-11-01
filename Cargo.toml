@@ -1,0 +1,50 @@
+[package]
+name = "ondalivre"
+version = "1.0.0"
+edition = "2021"
+description = "Automação de rádio portátil original (interoperável com listas ZaraRadio)"
+license = "MIT"
+authors = ["Rodrigo Miquilino"]
+
+[dependencies]
+eframe = { version = "0.31", default-features = false, features = ["glow", "x11", "wayland", "accesskit"] }
+egui = "0.31"
+egui_extras = { version = "0.31", features = ["datepicker"] }
+rodio = { version = "0.20", features = ["symphonia-all"] }
+cpal = "0.15"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+chrono = { version = "0.4", features = ["serde", "clock"] }
+rand = "0.8"
+thiserror = "2"
+anyhow = "1"
+walkdir = "2"
+notify = "7"
+rfd = "0.15"
+parking_lot = "0.12"
+once_cell = "1"
+uuid = { version = "1", features = ["v4"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+ureq = { version = "2", default-features = false, features = ["tls"] }
+sha2 = "0.10"
+hex = "0.4"
+symphonia = { version = "0.5", default-features = false, features = ["mp3", "wav", "ogg", "flac"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = "z"
+strip = true
+
+[[bin]]
+name = "ondalivre"
+path = "src/main.rs"
+
+[[example]]
+name = "smoke_play"
+path = "examples/smoke_play.rs"
+
+[build-dependencies]
+winresource = "0.1"

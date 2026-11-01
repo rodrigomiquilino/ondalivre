@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Upload this (or sync from the repo) as the project's default artifact
+  configuration in the SignPath dashboard after acceptance.
+  Root is zip-file because actions/upload-artifact stores a ZIP by default.
+-->
+<artifact-configuration xmlns="http://signpath.io/artifact-configuration/v1">
+  <parameters>
+    <parameter name="version" required="true" />
+  </parameters>
+  <zip-file>
+    <pe-file-set
+        product-name="OndaLivre"
+        company-name="Rodrigo Miquilino"
+        product-version="${version}"
+        file-version="${version}"
+        original-filename="ondalivre.exe">
+      <include path="ondalivre.exe" />
+      <for-each>
+        <authenticode-sign />
+      </for-each>
+    </pe-file-set>
+  </zip-file>
+</artifact-configuration>

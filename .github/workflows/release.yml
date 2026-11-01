@@ -1,0 +1,77 @@
+# Build Windows MSVC exe, submit to SignPath, publish signed artifact on tag.
+# Secrets: SIGNPATH_API_TOKEN
+# Vars:    ORGANIZATION_ID, PROJECT_SLUG, SIGNING_POLICY_SLUG
+# Optional var: ARTIFACT_CONFIGURATION_SLUG (defaults to "default")
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust (MSVC)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Build release exe
+        run: cargo build --release --target x86_64-pc-windows-msvc
+
+      - name: Stage unsigned artifact
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path unsigned | Out-Null
+          Copy-Item -Force `
+            target\x86_64-pc-windows-msvc\release\ondalivre.exe `
+            unsigned\ondalivre.exe
+
+      - name: Upload unsigned artifact
+        id: upload-unsigned
+        uses: actions/upload-artifact@v4
+        with:
+          name: ondalivre-windows-unsigned
+          path: unsigned/ondalivre.exe
+          if-no-files-found: error
+
+      - name: Resolve version for SignPath metadata
+        id: ver
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          if ($tag.StartsWith("v")) { $tag = $tag.Substring(1) }
+          "version=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          Write-Host "SignPath version param=$tag"
+
+      - name: Submit SignPath signing request
+        id: sign
+        uses: signpath/github-action-submit-signing-request@v3
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.ORGANIZATION_ID }}
+          project-slug: ${{ vars.PROJECT_SLUG }}
+          signing-policy-slug: ${{ vars.SIGNING_POLICY_SLUG }}
+          artifact-configuration-slug: ${{ vars.ARTIFACT_CONFIGURATION_SLUG || 'default' }}
+          github-artifact-id: ${{ steps.upload-unsigned.outputs.artifact-id }}
+          wait-for-completion: true
+          output-artifact-directory: signed
+          parameters: |
+            version: ${{ toJSON(steps.ver.outputs.version) }}
+
+      - name: Publish signed exe to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: signed/ondalivre.exe
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

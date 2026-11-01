@@ -1,0 +1,12 @@
+overlap_secs = 3.0
+fade_on_overlap = true
+fade_on_stop = true
+fade_secs = 1.5
+playlist_mode = "Repeat"
+temperature_c = 25
+humidity_pct = 60
+autostart = false
+now_playing_file = "now_playing.txt"
+playlog_file = "playlog.csv"
+volume = 0.9
+language = "pt-BR"

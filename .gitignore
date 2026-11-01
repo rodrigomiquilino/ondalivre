@@ -1,0 +1,39 @@
+/target/
+**/*.rs.bk
+Cargo.lock.bak
+
+# Local build / Wine / smoke leftovers
+/dist/windows/*.exe
+/dist/linux/ondalivre
+ol-*.txt
+*.log
+soak_*.log
+cargo-test*.txt
+
+# Editor / OS
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# Secrets and local env (never commit)
+.env
+.env.*
+!.env.example
+*.pem
+*.p12
+*.pfx
+secrets/
+.signpath-local/
+
+# Wine prefixes accidentally nested
+.wine*/
+
+# Local evidence / study dumps (not part of the release tree)
+/evidence/
+
+# Packaged archives (rebuild from source)
+/dist/*.tar.gz
+/dist/*.zip
