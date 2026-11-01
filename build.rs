@@ -38,13 +38,13 @@ fn main() {
             "OndaLivre - automacao de radio portatil (Fluent UI)",
         );
         res.set("CompanyName", "Rodrigo Miquilino");
-        res.set("FileVersion", "1.0.2");
-        res.set("ProductVersion", "1.0.2");
+        res.set("FileVersion", "1.0.3");
+        res.set("ProductVersion", "1.0.3");
         res.set("OriginalFilename", "ondalivre.exe");
         res.set("InternalName", "ondalivre");
         res.set("LegalCopyright", "Copyright (c) Rodrigo Miquilino");
-        res.set_version_info(winresource::VersionInfo::FILEVERSION, 0x0001_0000_0000_0000);
-        res.set_version_info(winresource::VersionInfo::PRODUCTVERSION, 0x0001_0000_0000_0000);
+        res.set_version_info(winresource::VersionInfo::FILEVERSION, 0x0001_0000_0003_0000);
+        res.set_version_info(winresource::VersionInfo::PRODUCTVERSION, 0x0001_0000_0003_0000);
         res.compile().expect("winresource compile failed");
         return;
     }
@@ -56,8 +56,8 @@ fn main() {
     let rc = format!(
         r#"1 ICON "{icon}"
 1 VERSIONINFO
-FILEVERSION 1,0,1,0
-PRODUCTVERSION 1,0,1,0
+FILEVERSION 1,0,3,0
+PRODUCTVERSION 1,0,3,0
 FILEOS 0x40004
 FILETYPE 0x1
 BEGIN
@@ -67,12 +67,12 @@ BEGIN
     BEGIN
       VALUE "CompanyName", "Rodrigo Miquilino"
       VALUE "FileDescription", "OndaLivre - automacao de radio portatil (Fluent UI)"
-      VALUE "FileVersion", "1.0.2"
+      VALUE "FileVersion", "1.0.3"
       VALUE "InternalName", "ondalivre"
       VALUE "LegalCopyright", "Copyright (c) Rodrigo Miquilino"
       VALUE "OriginalFilename", "ondalivre.exe"
       VALUE "ProductName", "OndaLivre"
-      VALUE "ProductVersion", "1.0.2"
+      VALUE "ProductVersion", "1.0.3"
     END
   END
   BLOCK "VarFileInfo"

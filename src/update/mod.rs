@@ -418,25 +418,25 @@ mod tests {
     #[test]
     fn current_release_not_offered_as_update() {
         // Remote tag equal to CARGO_PKG_VERSION must not offer update.
-        assert_eq!(CURRENT_VERSION, "1.0.2", "bump this assert when shipping a new version");
+        assert_eq!(CURRENT_VERSION, "1.0.3", "bump this assert when shipping a new version");
         assert_eq!(
-            compare_versions(CURRENT_VERSION, "1.0.2"),
+            compare_versions(CURRENT_VERSION, "1.0.3"),
             Some(Ordering::Equal)
         );
         assert_eq!(
-            compare_versions(CURRENT_VERSION, "v1.0.2"),
+            compare_versions(CURRENT_VERSION, "v1.0.3"),
             Some(Ordering::Equal)
         );
         assert!(
-            !is_newer("1.0.2"),
-            "in-app updater must treat v1.0.2 as current (no update)"
+            !is_newer("1.0.3"),
+            "in-app updater must treat v1.0.3 as current (no update)"
         );
         assert!(
-            !is_newer("v1.0.2"),
+            !is_newer("v1.0.3"),
             "v-prefix remote tag must also count as current"
         );
         // Sanity: a fabricated newer tag still triggers the offer path
-        assert!(is_newer("1.0.3"));
+        assert!(is_newer("1.0.4"));
         assert!(is_newer("v1.1.0"));
     }
 
