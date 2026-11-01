@@ -880,6 +880,24 @@ impl Engine {
         self.active_jingle == Some((page, idx)) && !self.jingle_player.is_empty()
     }
 
+    /// Combined instantaneous meter from air + jingle + aux (max peak / RMS).
+    pub fn take_vu_levels(&self) -> crate::audio::meter::InstantLevels {
+        let mut acc = self.player.meter_take();
+        acc = acc.max_merge(self.jingle_player.meter_take());
+        for p in &self.aux_players {
+            acc = acc.max_merge(p.meter_take());
+        }
+        acc
+    }
+
+    pub fn clear_vu_levels(&self) {
+        self.player.meter_clear();
+        self.jingle_player.meter_clear();
+        for p in &self.aux_players {
+            p.meter_clear();
+        }
+    }
+
     pub fn jingle_is_playing(&self) -> bool {
         self.active_jingle.is_some() && !self.jingle_player.is_empty()
     }

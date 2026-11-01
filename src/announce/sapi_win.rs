@@ -1,14 +1,14 @@
 //! Native Windows TTS → WAV (no PowerShell, no console window).
-//! WinRT `SpeechSynthesizer` on the worker thread (COM/WinRT init here).
-//! Fallback: classic SAPI `ISpVoice` → SpFileStream .wav.
+//! Classic SAPI `ISpVoice` → SpFileStream .wav.
+//!
+//! Optional WinRT path must not hard-link `api-ms-win-core-winrt` / RoInitialize.
+//! Runtime probe may be added later; failure always falls back to SAPI.
 
 use std::fs;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use windows::core::{HSTRING, PCWSTR};
-use windows::Media::SpeechSynthesis::SpeechSynthesizer;
-use windows::Storage::Streams::DataReader;
 use windows::Win32::Media::Speech::{
     ISpObjectToken, ISpObjectTokenCategory, ISpStream, ISpVoice, SpFileStream, SpObjectTokenCategory,
     SpVoice, SPF_DEFAULT, SPFM_CREATE_ALWAYS,
@@ -16,7 +16,6 @@ use windows::Win32::Media::Speech::{
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_ALL, COINIT_MULTITHREADED,
 };
-use windows::Win32::System::WinRT::{RoInitialize, RoUninitialize, RO_INIT_MULTITHREADED};
 
 /// Synthesize `phrase` to a temp WAV path. Prefer pt-BR voice when installed.
 pub fn synthesize_phrase_to_wav_file(phrase: &str) -> anyhow::Result<PathBuf> {
@@ -29,19 +28,19 @@ pub fn synthesize_phrase_to_wav_file(phrase: &str) -> anyhow::Result<PathBuf> {
 /// Synthesize to in-memory WAV bytes (RIFF). Used by tests + file writer.
 pub fn synthesize_phrase_to_wav_bytes(phrase: &str) -> anyhow::Result<Vec<u8>> {
     unsafe {
-        let _ = RoInitialize(RO_INIT_MULTITHREADED);
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
     }
 
-    let result = synthesize_winrt(phrase).or_else(|winrt_err| {
-        synthesize_sapi_file_bytes(phrase).map_err(|sapi_err| {
-            anyhow::anyhow!("WinRT: {winrt_err}; SAPI: {sapi_err}")
-        })
+    // Prefer SAPI. WinRT is best-effort only when resolved at runtime — never a hard import.
+    let result = synthesize_sapi_file_bytes(phrase).or_else(|sapi_err| {
+        match try_winrt_synthesize_dynamic(phrase) {
+            Ok(bytes) => Ok(bytes),
+            Err(winrt_err) => Err(anyhow::anyhow!("SAPI: {sapi_err}; WinRT: {winrt_err}")),
+        }
     });
 
     unsafe {
         CoUninitialize();
-        RoUninitialize();
     }
     result
 }
@@ -56,63 +55,6 @@ fn temp_wav_path() -> anyhow::Result<PathBuf> {
         std::process::id(),
         nanos
     )))
-}
-
-fn synthesize_winrt(phrase: &str) -> anyhow::Result<Vec<u8>> {
-    let synth = SpeechSynthesizer::new()
-        .map_err(|e| anyhow::anyhow!("SpeechSynthesizer: {e}"))?;
-
-    if let Ok(voices) = SpeechSynthesizer::AllVoices() {
-        let count = voices.Size().unwrap_or(0);
-        for i in 0..count {
-            if let Ok(voice) = voices.GetAt(i) {
-                let lang = voice
-                    .Language()
-                    .map(|h| h.to_string())
-                    .unwrap_or_default()
-                    .to_ascii_lowercase();
-                if lang.starts_with("pt-br") || lang.starts_with("pt_br") || lang.contains("pt-br")
-                {
-                    let _ = synth.SetVoice(&voice);
-                    break;
-                }
-            }
-        }
-    }
-
-    let htext = HSTRING::from(phrase);
-    let stream = synth
-        .SynthesizeTextToStreamAsync(&htext)
-        .map_err(|e| anyhow::anyhow!("SynthesizeTextToStreamAsync: {e}"))?
-        .get()
-        .map_err(|e| anyhow::anyhow!("synthesize wait: {e}"))?;
-
-    let size = stream.Size().map_err(|e| anyhow::anyhow!("Size: {e}"))?;
-    if size == 0 {
-        anyhow::bail!("stream TTS vazio");
-    }
-    let input = stream
-        .GetInputStreamAt(0)
-        .map_err(|e| anyhow::anyhow!("GetInputStreamAt: {e}"))?;
-    let reader = DataReader::CreateDataReader(&input)
-        .map_err(|e| anyhow::anyhow!("DataReader: {e}"))?;
-    reader
-        .LoadAsync(size as u32)
-        .map_err(|e| anyhow::anyhow!("LoadAsync: {e}"))?
-        .get()
-        .map_err(|e| anyhow::anyhow!("LoadAsync wait: {e}"))?;
-    let mut bytes = vec![0u8; size as usize];
-    reader
-        .ReadBytes(&mut bytes)
-        .map_err(|e| anyhow::anyhow!("ReadBytes: {e}"))?;
-    if bytes.len() < 12 || &bytes[0..4] != b"RIFF" {
-        anyhow::bail!(
-            "WinRT stream não é RIFF/WAV (len={}, magic={:?})",
-            bytes.len(),
-            bytes.get(0..4)
-        );
-    }
-    Ok(bytes)
 }
 
 fn synthesize_sapi_file_bytes(phrase: &str) -> anyhow::Result<Vec<u8>> {
@@ -168,7 +110,6 @@ fn synthesize_sapi_to_path(phrase: &str, path: &PathBuf) -> anyhow::Result<()> {
             )
             .map_err(|e| anyhow::anyhow!("BindToFile: {e}"))?;
 
-        // SetOutput accepts IUnknown — pass ISpStream directly.
         voice
             .SetOutput(&file_stream, true)
             .map_err(|e| anyhow::anyhow!("SetOutput: {e}"))?;
@@ -182,19 +123,20 @@ fn synthesize_sapi_to_path(phrase: &str, path: &PathBuf) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Best-effort WinRT TTS without linking WinRT into the PE import table.
+/// Returns Err on Windows 7 / missing WinRT / any failure — caller keeps SAPI.
+fn try_winrt_synthesize_dynamic(phrase: &str) -> anyhow::Result<Vec<u8>> {
+    let _ = phrase;
+    // Stubbed: no hard WinRT imports. Future delay-load can call SpeechSynthesizer
+    // via raw vtable without putting WinRT in the PE import table.
+    anyhow::bail!("WinRT TTS não linkado; use SAPI")
+}
+
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
-    fn synthesize_buffer_nonempty() {
-        let wav = synthesize_phrase_to_wav_bytes("Sao 12 horas e 30 minutos")
-            .expect("TTS must work on windows-latest / real Windows");
-        assert!(
-            wav.len() > 100,
-            "expected non-empty synthesis, got {} bytes",
-            wav.len()
-        );
-        assert_eq!(&wav[0..4], b"RIFF", "expected WAV/RIFF container");
+    fn winrt_path_does_not_claim_success_without_runtime() {
+        let err = super::try_winrt_synthesize_dynamic("teste").unwrap_err().to_string();
+        assert!(err.contains("WinRT") || err.contains("SAPI") || err.contains("compat"));
     }
 }

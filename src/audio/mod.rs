@@ -1,6 +1,10 @@
+pub mod meter;
+pub use meter::{dbfs_to_meter01, linear_to_dbfs, InstantLevels, MeterBallistics, MeterBus, MeterTap};
+
 use cpal::traits::{DeviceTrait, HostTrait};
+use meter::set_gain;
 use parking_lot::Mutex;
-use rodio::{Decoder, OutputStream, OutputStreamHandle, Sink};
+use rodio::{Decoder, OutputStream, OutputStreamHandle, Sink, Source};
 use std::fs::File;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
@@ -31,6 +35,10 @@ pub struct Player {
     started: Arc<Mutex<Option<Instant>>>,
     current_path: Arc<Mutex<Option<PathBuf>>>,
     volume: Arc<Mutex<f32>>,
+    /// Linear gain applied inside MeterTap (sink volume stays 1.0).
+    gain: Arc<AtomicU32>,
+    /// Shared sample bus for VU (peak/RMS after gain).
+    pub meter: Arc<MeterBus>,
     /// Active primary + fading voices (instrumentation / tests).
     voice_count: Arc<AtomicU32>,
     pub device_name: Option<String>,
@@ -66,6 +74,8 @@ impl Player {
             started: Arc::new(Mutex::new(None)),
             current_path: Arc::new(Mutex::new(None)),
             volume: Arc::new(Mutex::new(0.9)),
+            gain: meter::gain_arc(0.9),
+            meter: Arc::new(MeterBus::new()),
             voice_count: Arc::new(AtomicU32::new(0)),
             device_name,
             last_source_tag: Arc::new(Mutex::new(None)),
@@ -98,6 +108,8 @@ impl Player {
             started: Arc::new(Mutex::new(None)),
             current_path: Arc::new(Mutex::new(None)),
             volume: Arc::new(Mutex::new(0.9)),
+            gain: meter::gain_arc(0.9),
+            meter: Arc::new(MeterBus::new()),
             voice_count: Arc::new(AtomicU32::new(0)),
             device_name: device_name.map(|s| s.to_string()),
             last_source_tag: Arc::new(Mutex::new(None)),
@@ -131,9 +143,19 @@ impl Player {
     pub fn set_volume(&self, v: f32) {
         let v = v.clamp(0.0, 1.0);
         *self.volume.lock() = v;
+        set_gain(&self.gain, v);
+        // Audible gain is applied in MeterTap; keep sink at unity.
         if let Some(sink) = self.sink.lock().as_ref() {
-            sink.set_volume(v);
+            sink.set_volume(1.0);
         }
+    }
+
+    pub fn meter_take(&self) -> meter::InstantLevels {
+        self.meter.take_instant()
+    }
+
+    pub fn meter_clear(&self) {
+        self.meter.clear();
     }
 
     pub fn play_file(&self, path: &Path) -> anyhow::Result<()> {
@@ -155,7 +177,6 @@ impl Player {
         take_secs: Option<f32>,
         fade_in_secs: f32,
     ) -> anyhow::Result<()> {
-        use rodio::Source;
         // Hard cut previous primary voice (idempotent restart = exactly 1 primary).
         self.stop_primary_immediate(source);
         *self.last_source_tag.lock() = Some(source);
@@ -175,12 +196,22 @@ impl Player {
             OutputBackend::Live { handle, .. } => {
                 let sink = Sink::try_new(handle)?;
                 let start_vol = if fade_in > 0.02 { 0.0 } else { target_vol };
-                sink.set_volume(start_vol);
-                let src = decoder.skip_duration(Duration::from_secs_f32(cue));
+                set_gain(&self.gain, start_vol);
+                sink.set_volume(1.0);
+                let src = decoder
+                    .convert_samples::<f32>()
+                    .skip_duration(Duration::from_secs_f32(cue));
+                let bus = Arc::clone(&self.meter);
+                let gain = Arc::clone(&self.gain);
                 if let Some(secs) = take {
-                    sink.append(src.take_duration(Duration::from_secs_f32(secs)));
+                    let tapped = MeterTap::new(
+                        src.take_duration(Duration::from_secs_f32(secs)),
+                        bus,
+                        gain,
+                    );
+                    sink.append(tapped);
                 } else {
-                    sink.append(src);
+                    sink.append(MeterTap::new(src, bus, gain));
                 }
                 sink.play();
                 *self.sink.lock() = Some(sink);
@@ -191,10 +222,11 @@ impl Player {
             }
             OutputBackend::Headless => {
                 drop(decoder);
+                set_gain(&self.gain, target_vol);
                 *self.headless_active.lock() = true;
                 *self.headless_started.lock() = Some(Instant::now());
                 self.voice_count.store(1, Ordering::Relaxed);
-                let _ = (cue, take, fade_in, target_vol);
+                let _ = (cue, take, fade_in);
             }
         }
         *self.started.lock() = Some(Instant::now());
@@ -204,21 +236,19 @@ impl Player {
 
     fn spawn_fade_in(&self, fade_secs: f32, target_vol: f32) {
         let sink_arc = Arc::clone(&self.sink);
+        let gain = Arc::clone(&self.gain);
         std::thread::spawn(move || {
             let steps = 20;
             let step = Duration::from_secs_f32((fade_secs.max(0.05)) / steps as f32);
             for i in 1..=steps {
                 let factor = i as f32 / steps as f32;
-                if let Some(s) = sink_arc.lock().as_ref() {
-                    s.set_volume(target_vol * factor);
-                } else {
+                set_gain(&gain, target_vol * factor);
+                if sink_arc.lock().as_ref().is_none() {
                     break;
                 }
                 std::thread::sleep(step);
             }
-            if let Some(s) = sink_arc.lock().as_ref() {
-                s.set_volume(target_vol);
-            }
+            set_gain(&gain, target_vol);
         });
     }
 
@@ -234,6 +264,7 @@ impl Player {
         *self.headless_started.lock() = None;
         *self.started.lock() = None;
         *self.current_path.lock() = None;
+        self.meter.clear();
     }
 
     pub fn stop_immediate(&self) {
@@ -283,14 +314,14 @@ impl Player {
         // Spawn fade on the last fading sink.
         let fading_arc = Arc::clone(&self.fading);
         let voices = Arc::clone(&self.voice_count);
-        let vol0 = *self.volume.lock();
+        // Samples already have Player gain baked by MeterTap; fade the sink from unity.
         std::thread::spawn(move || {
             let steps = 20;
             let step = Duration::from_secs_f32((fade_secs.max(0.05)) / steps as f32);
             for i in 0..steps {
                 let factor = 1.0 - (i as f32 / steps as f32);
                 if let Some(s) = fading_arc.lock().last() {
-                    s.set_volume(vol0 * factor);
+                    s.set_volume(factor);
                 } else {
                     break;
                 }
@@ -364,7 +395,8 @@ impl Player {
                 let mut g = self.sink.lock();
                 if g.is_none() {
                     let sink = Sink::try_new(handle)?;
-                    sink.set_volume(*self.volume.lock());
+                    set_gain(&self.gain, *self.volume.lock());
+                    sink.set_volume(1.0);
                     sink.play();
                     *g = Some(sink);
                     self.voice_count.fetch_add(1, Ordering::Relaxed);
@@ -385,8 +417,9 @@ impl Player {
         }
         self.ensure_sink()?;
         let buf = rodio::buffer::SamplesBuffer::new(1, sample_rate.max(1), samples);
+        let tapped = MeterTap::new(buf, Arc::clone(&self.meter), Arc::clone(&self.gain));
         if let Some(sink) = self.sink.lock().as_ref() {
-            sink.append(buf);
+            sink.append(tapped);
         }
         Ok(())
     }

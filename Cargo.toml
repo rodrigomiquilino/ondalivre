@@ -51,16 +51,11 @@ winresource = "0.1"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [
-    "Media_SpeechSynthesis",
-    "Storage_Streams",
-    "Foundation",
-    "Foundation_Collections",
-    "Globalization",
+    # SAPI only — no hard WinRT / Media_SpeechSynthesis imports.
     "Win32_Foundation",
     "Win32_Media_Speech",
     "Win32_Media_Audio",
     "Win32_System_Com",
     "Win32_System_Com_StructuredStorage",
     "Win32_System_Ole",
-    "Win32_System_WinRT",
 ] }

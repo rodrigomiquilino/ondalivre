@@ -58,6 +58,8 @@ pub struct OndaApp {
     pub nav: NavPage,
     pub find_query: String,
     pub find_results: Vec<usize>,
+    /// Focar o campo Localizar inline na playlist (Ctrl+F / menu).
+    pub find_request_focus: bool,
     pub folder_query: String,
     pub folder_results: Vec<PathBuf>,
     pub anim: f32,
@@ -75,7 +77,7 @@ pub struct OndaApp {
     pub password_set_input: String,
     pub input_device_list: Vec<String>,
     pub icons: Option<IconSet>,
-    pub vu: f32,
+    pub vu_ballistics: crate::audio::MeterBallistics,
     /// Índice de inserção ao arrastar arquivos sobre a playlist.
     pub drop_insert_at: Option<usize>,
     /// Evita reaplicar Visuals todo frame (CPU/GPU).
@@ -142,6 +144,7 @@ impl OndaApp {
             nav: NavPage::Studio,
             find_query: String::new(),
             find_results: vec![],
+            find_request_focus: false,
             folder_query: String::new(),
             folder_results: vec![],
             anim: 0.0,
@@ -158,7 +161,7 @@ impl OndaApp {
             password_set_input: String::new(),
             input_device_list: crate::satellite::list_input_devices(),
             icons: None,
-            vu: 0.0,
+            vu_ballistics: crate::audio::MeterBallistics::default(),
             drop_insert_at: None,
             last_theme_key: None,
             update_rx: None,
@@ -283,25 +286,28 @@ impl eframe::App for OndaApp {
         };
         let animating =
             air_live || satellite_live || jingle_live || sapi_busy || self.toast_alpha > 0.01;
-        if animating {
-            self.anim = (self.anim + dt * 1.8) % 1000.0;
-            let target = if playing {
-                0.35 + 0.55 * ((self.anim * 2.7).sin().abs())
-            } else if satellite_live {
-                0.2 + 0.3 * ((self.anim * 1.9).sin().abs())
-            } else if jingle_live {
-                0.15 + 0.25 * ((self.anim * 3.1).sin().abs())
+        // Real VU from output-stage MeterTap (post-gain). Zero when nothing is live.
+        {
+            let eng = self.engine.lock();
+            let any_audio = !eng.player.is_empty()
+                || !eng.jingle_player.is_empty()
+                || eng.aux_players.iter().any(|p| !p.is_empty());
+            if any_audio {
+                let inst = eng.take_vu_levels();
+                drop(eng);
+                self.vu_ballistics.push(inst);
             } else {
-                0.05
-            };
-            // VU smoothed attack/release
-            let coeff = if target > self.vu { dt * 14.0 } else { dt * 6.0 };
-            self.vu += (target - self.vu) * coeff.clamp(0.0, 1.0);
-            // ~30–45 FPS while any channel is active (progress/VU/countdown smooth)
-            ctx.request_repaint_after(std::time::Duration::from_millis(22));
+                drop(eng);
+                self.engine.lock().clear_vu_levels();
+                self.vu_ballistics.reset();
+            }
+        }
+        let _ = dt;
+        if animating || air_live || jingle_live {
+            self.anim = (self.anim + dt * 1.8) % 1000.0;
+            // ≥45 FPS while audio/progress/VU active
+            ctx.request_repaint_after(std::time::Duration::from_millis(16));
         } else {
-            self.vu = 0.05;
-            // Idle: align next paint to the next wall-clock second boundary.
             let now = chrono::Local::now();
             let nanos = now.timestamp_subsec_nanos() as u64;
             let ms_into = nanos / 1_000_000;
@@ -363,7 +369,6 @@ impl eframe::App for OndaApp {
         self.handle_shortcuts(ctx);
         self.handle_file_drops(ctx);
         self.title_bar(ctx, dark);
-        self.classic_menu_bar(ctx, dark);
         self.win_session_resume(ctx, dark);
         self.nav_pane(ctx, dark);
         self.command_bar(ctx, dark);
@@ -639,8 +644,10 @@ impl OndaApp {
 
 
     fn title_bar(&mut self, ctx: &egui::Context, dark: bool) {
+        let show_menu = self.engine.lock().config.show_classic_menu;
+        let bar_h = if show_menu { 36.0 } else { 32.0 };
         egui::TopBottomPanel::top("mica_title")
-            .exact_height(32.0)
+            .exact_height(bar_h)
             .frame(
                 egui::Frame::new()
                     .fill(mica_bg(dark))
@@ -667,7 +674,7 @@ impl OndaApp {
                     ));
                 }
                 ui.horizontal(|ui| {
-                    ui.set_height(32.0);
+                    ui.set_height(bar_h);
                     if let Some(img) = self.icons.as_ref().and_then(|i| i.image("radio", 16.0)) {
                         ui.add(img.tint(self.accent()));
                     }
@@ -677,6 +684,10 @@ impl OndaApp {
                             .strong()
                             .color(if dark { Color32::from_gray(230) } else { Color32::from_gray(30) }),
                     );
+                    if show_menu {
+                        ui.add_space(8.0);
+                        self.classic_menu_inline(ui, ctx, dark);
+                    }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.spacing_mut().item_spacing.x = 0.0;
                         if caption_button(ui, CaptionKind::Close, dark).clicked() {
@@ -816,7 +827,9 @@ impl OndaApp {
         });
 
         if ctrl_f {
-            self.windows.find = true;
+            self.windows.find = false;
+            self.find_request_focus = true;
+            self.nav = NavPage::Studio;
         }
         if ctrl_o {
             self.open_playlist();
@@ -906,87 +919,168 @@ impl OndaApp {
             .resizable(false)
             .frame(nav_frame(dark))
             .show(ctx, |ui| {
-                // Marca só na title bar (sem duplicar "OndaLivre" aqui).
-                ui.add_space(SPACE_2);
-                ui.label(
-                    RichText::new("Operação")
-                        .font(typo::caption())
-                        .color(secondary_color(dark)),
+                let station = self.engine.lock().config.station_name.clone();
+                let bottom_h = 72.0_f32;
+                let full = ui.available_rect_before_wrap();
+                let top_max = egui::pos2(full.right(), (full.bottom() - bottom_h).max(full.top() + 40.0));
+                let top_rect = egui::Rect::from_min_max(full.min, top_max);
+                let bot_rect = egui::Rect::from_min_max(
+                    egui::pos2(full.left(), top_rect.bottom()),
+                    full.max,
                 );
-                ui.add_space(4.0);
-                for (page, icon, label) in [(NavPage::Studio, "home", "No ar")] {
-                    let selected = self.nav == page;
-                    if self.nav_icon_btn(ui, icon, label, selected).clicked() {
-                        self.nav = page;
-                    }
-                }
-                ui.add_space(10.0);
-                ui.separator();
-                ui.label(RichText::new("Gestão").font(typo::caption()).color(secondary_color(dark)));
-                ui.add_space(4.0);
-                for (page, icon, label) in [
-                    (NavPage::Events, "calendar", "Editar eventos"),
-                    (NavPage::Jingles, "music_note", "Editar jingles"),
-                    (NavPage::Sweepers, "pulse", "Sweepers"),
-                    (NavPage::Library, "library", "Biblioteca"),
-                    (NavPage::Logs, "document", "Logs"),
-                    (NavPage::Settings, "settings", "Configurações"),
-                ] {
-                    let selected = self.nav == page;
-                    if self.nav_icon_btn(ui, icon, label, selected).clicked() {
-                        self.nav = page;
-                    }
+
+                let mut top_ui = ui.new_child(
+                    egui::UiBuilder::new()
+                        .id_salt("nav_top")
+                        .max_rect(top_rect)
+                        .layout(egui::Layout::top_down(egui::Align::Min)),
+                );
+                top_ui.set_clip_rect(top_rect);
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .id_salt("nav_scroll")
+                    .show(&mut top_ui, |ui| {
+                        ui.add_space(SPACE_2);
+                        ui.label(
+                            RichText::new("Operação")
+                                .font(typo::caption())
+                                .color(secondary_color(dark)),
+                        );
+                        ui.add_space(4.0);
+                        for (page, icon, label) in [(NavPage::Studio, "home", "No ar")] {
+                            let selected = self.nav == page;
+                            if self.nav_icon_btn(ui, icon, label, selected).clicked() {
+                                self.nav = page;
+                            }
+                        }
+                        ui.add_space(10.0);
+                        ui.separator();
+                        ui.label(
+                            RichText::new("Gestão")
+                                .font(typo::caption())
+                                .color(secondary_color(dark)),
+                        );
+                        ui.add_space(4.0);
+                        for (page, icon, label) in [
+                            (NavPage::Events, "calendar", "Editar eventos"),
+                            (NavPage::Jingles, "music_note", "Editar jingles"),
+                            (NavPage::Sweepers, "pulse", "Sweepers"),
+                            (NavPage::Library, "library", "Biblioteca"),
+                            (NavPage::Logs, "document", "Logs"),
+                            (NavPage::Settings, "settings", "Configurações"),
+                        ] {
+                            let selected = self.nav == page;
+                            if self.nav_icon_btn(ui, icon, label, selected).clicked() {
+                                self.nav = page;
+                            }
+                            ui.add_space(2.0);
+                        }
+                        ui.add_space(12.0);
+                        ui.separator();
+                        ui.label(
+                            RichText::new("Ferramentas")
+                                .font(typo::caption())
+                                .color(secondary_color(dark)),
+                        );
+                        ui.add_space(4.0);
+                        if self.nav_icon_btn(ui, "headphones", "Cue / pré-escuta", false).clicked() {
+                            self.windows.cue = true;
+                        }
+                        if self.nav_icon_btn(ui, "speaker", "Players auxiliares", false).clicked() {
+                            self.windows.aux = true;
+                        }
+                        if self.nav_icon_btn(ui, "info", "Sobre", false).clicked() {
+                            self.windows.about = true;
+                        }
+                        if self
+                            .nav_icon_btn(ui, "document", "Verificar atualizações", false)
+                            .clicked()
+                        {
+                            self.start_update_check(true);
+                        }
+                        ui.add_space(8.0);
+                    });
+
+                let mut bot_ui = ui.new_child(
+                    egui::UiBuilder::new()
+                        .id_salt("nav_station")
+                        .max_rect(bot_rect)
+                        .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                );
+                bot_ui.set_clip_rect(bot_rect);
+                bot_ui.vertical(|ui| {
                     ui.add_space(2.0);
-                }
-                ui.add_space(12.0);
-                ui.separator();
-                ui.label(RichText::new("Ferramentas").font(typo::caption()).color(secondary_color(dark)));
-                ui.add_space(4.0);
-                if self.nav_icon_btn(ui, "headphones", "Cue / pré-escuta", false).clicked() {
-                    self.windows.cue = true;
-                }
-                if self.nav_icon_btn(ui, "speaker", "Players auxiliares", false).clicked() {
-                    self.windows.aux = true;
-                }
-                if self.nav_icon_btn(ui, "info", "Sobre", false).clicked() {
-                    self.windows.about = true;
-                }
-                if self.nav_icon_btn(ui, "document", "Verificar atualizações", false).clicked() {
-                    self.start_update_check(true);
-                }
-                ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
-                    ui.add_space(SPACE_2);
-                    let station = self.engine.lock().config.station_name.clone();
-                    ui.label(RichText::new(if station.is_empty() { "Estação" } else { &station }).small().weak());
+                    ui.separator();
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new("Estação")
+                            .font(typo::caption())
+                            .color(secondary_color(dark)),
+                    );
+                    let name = if station.is_empty() {
+                        "—"
+                    } else {
+                        station.as_str()
+                    };
+                    ui.label(
+                        RichText::new(name)
+                            .size(13.0)
+                            .strong()
+                            .color(if dark {
+                                Color32::from_gray(210)
+                            } else {
+                                Color32::from_gray(40)
+                            }),
+                    );
+                    ui.add_space(6.0);
                 });
             });
     }
 
+
     fn command_bar(&mut self, ctx: &egui::Context, dark: bool) {
-        egui::TopBottomPanel::top("cmd")
-            .frame(command_frame(dark))
-            .show(ctx, |ui| {
+        let compact = self.nav != NavPage::Studio;
+        let frame = if compact {
+            egui::Frame::new()
+                .fill(mica_layer(dark))
+                .inner_margin(egui::Margin::symmetric(SPACE_3 as i8, 4))
+                .stroke(card_stroke(dark))
+        } else {
+            command_frame(dark)
+        };
+        let mut panel = egui::TopBottomPanel::top("cmd").frame(frame);
+        if compact {
+            panel = panel.exact_height(36.0);
+        }
+        panel.show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = SPACE_2;
+                    ui.spacing_mut().item_spacing.x = if compact { 6.0 } else { SPACE_2 };
                     let accent = self.accent();
+                    let play_w = if compact { 72.0 } else { 96.0 };
+                    let play_h = if compact { 26.0 } else { CTRL_H };
                     let play = egui::Button::new(
-                        RichText::new("  Play").color(Color32::from_rgb(12, 40, 18)).strong().size(14.0),
+                        RichText::new(if compact { " Play" } else { "  Play" })
+                            .color(Color32::from_rgb(12, 40, 18))
+                            .strong()
+                            .size(if compact { 12.0 } else { 14.0 }),
                     )
                     .fill(Color32::from_rgb(0x6C, 0xC0, 0x6C))
                     .corner_radius(egui::CornerRadius::same(RADIUS_CTRL));
-                    let play_r = ui.add_sized([96.0, CTRL_H], play);
-                    if let Some(tex) = self.icons.as_ref().and_then(|i| i.get("play")) {
-                        let r = play_r.rect;
-                        egui::Image::new(tex)
-                            .fit_to_exact_size(egui::vec2(16.0, 16.0))
-                            .tint(Color32::from_rgb(12, 40, 18))
-                            .paint_at(
-                                ui,
-                                egui::Rect::from_min_size(
-                                    egui::pos2(r.left() + 12.0, r.center().y - 8.0),
-                                    egui::vec2(16.0, 16.0),
-                                ),
-                            );
+                    let play_r = ui.add_sized([play_w, play_h], play);
+                    if !compact {
+                        if let Some(tex) = self.icons.as_ref().and_then(|i| i.get("play")) {
+                            let r = play_r.rect;
+                            egui::Image::new(tex)
+                                .fit_to_exact_size(egui::vec2(16.0, 16.0))
+                                .tint(Color32::from_rgb(12, 40, 18))
+                                .paint_at(
+                                    ui,
+                                    egui::Rect::from_min_size(
+                                        egui::pos2(r.left() + 12.0, r.center().y - 8.0),
+                                        egui::vec2(16.0, 16.0),
+                                    ),
+                                );
+                        }
                     }
                     if play_r.clicked() {
                         self.engine.lock().play();
@@ -1000,45 +1094,61 @@ impl OndaApp {
                     if subtle_button(ui, "Próximo", dark).clicked() {
                         self.engine.lock().next();
                     }
-                    ui.separator();
-                    {
+                    if !compact {
+                        ui.separator();
+                        {
+                            let mut eng = self.engine.lock();
+                            let opts = [
+                                (PlaylistMode::Normal, mode_label(PlaylistMode::Normal)),
+                                (PlaylistMode::Repeat, mode_label(PlaylistMode::Repeat)),
+                                (PlaylistMode::Shuffle, mode_label(PlaylistMode::Shuffle)),
+                                (PlaylistMode::Manual, mode_label(PlaylistMode::Manual)),
+                                (PlaylistMode::Random, mode_label(PlaylistMode::Random)),
+                            ];
+                            let _ = fluent_combo(ui, "mode", &mut eng.playlist.mode, &opts, dark, accent);
+                            ui.label(RichText::new("Vol").font(typo::caption()).color(secondary_color(dark)));
+                            let _ = fluent_slider(ui, &mut eng.config.volume, 0.0..=1.0, accent, dark);
+                            ui.label(
+                                RichText::new(format!("{:.0}%", eng.config.volume * 100.0))
+                                    .font(typo::caption())
+                                    .color(secondary_color(dark)),
+                            );
+                            eng.player.set_volume(eng.config.volume);
+                        }
+                    } else {
+                        // Compact: volume only, no mode combo clutter.
                         let mut eng = self.engine.lock();
-                        let opts = [
-                            (PlaylistMode::Normal, mode_label(PlaylistMode::Normal)),
-                            (PlaylistMode::Repeat, mode_label(PlaylistMode::Repeat)),
-                            (PlaylistMode::Shuffle, mode_label(PlaylistMode::Shuffle)),
-                            (PlaylistMode::Manual, mode_label(PlaylistMode::Manual)),
-                            (PlaylistMode::Random, mode_label(PlaylistMode::Random)),
-                        ];
-                        let _ = fluent_combo(ui, "mode", &mut eng.playlist.mode, &opts, dark, accent);
                         ui.label(RichText::new("Vol").font(typo::caption()).color(secondary_color(dark)));
                         let _ = fluent_slider(ui, &mut eng.config.volume, 0.0..=1.0, accent, dark);
-                        ui.label(
-                            RichText::new(format!("{:.0}%", eng.config.volume * 100.0))
-                                .font(typo::caption())
-                                .color(secondary_color(dark)),
-                        );
                         eng.player.set_volume(eng.config.volume);
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let now = Local::now().format("%H:%M:%S").to_string();
-                        ui.label(RichText::new(now).size(22.0).color(accent).strong());
-                        if subtle_button(ui, "Anunciar hora", dark)
-                            .on_hover_text("Toca os audios de hora (atalho operacional)")
-                            .clicked()
-                        {
-                            self.engine.lock().announce_time();
-                        }
-                        if subtle_button(ui, "Abrir lista", dark)
-                            .on_hover_text("Abrir arquivo .lst / .m3u (Ctrl+O)")
-                            .clicked()
-                        {
-                            self.open_playlist();
+                        ui.label(
+                            RichText::new(now)
+                                .size(if compact { 16.0 } else { 22.0 })
+                                .color(accent)
+                                .strong(),
+                        );
+                        if !compact {
+                            if subtle_button(ui, "Anunciar hora", dark)
+                                .on_hover_text("Toca os audios de hora (atalho operacional)")
+                                .clicked()
+                            {
+                                self.engine.lock().announce_time();
+                            }
+                            if subtle_button(ui, "Abrir lista", dark)
+                                .on_hover_text("Abrir arquivo .lst / .m3u (Ctrl+O)")
+                                .clicked()
+                            {
+                                self.open_playlist();
+                            }
                         }
                     });
                 });
             });
     }
+
 
     fn central(&mut self, ctx: &egui::Context, dark: bool) {
         egui::CentralPanel::default()
@@ -1291,7 +1401,7 @@ clip={:?}
                                         .font(typo::caption())
                                         .color(secondary_color(dark)),
                                 );
-                                draw_vu_lr(ui, self.vu, accent, dark, 80.0);
+                                draw_vu_lr(ui, &self.vu_ballistics, dark, 96.0);
                             },
                         );
                     });
@@ -1337,26 +1447,6 @@ clip={:?}
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if subtle_icon_button(
                                 ui,
-                                "Localizar",
-                                dark,
-                                self.icons.as_ref().and_then(|i| i.get("search")).map(|t| {
-                                    (
-                                        t,
-                                        if dark {
-                                            Color32::from_gray(210)
-                                        } else {
-                                            Color32::from_gray(50)
-                                        },
-                                    )
-                                }),
-                            )
-                            .on_hover_text("Localizar na lista (Ctrl+F)")
-                            .clicked()
-                            {
-                                self.windows.find = true;
-                            }
-                            if subtle_icon_button(
-                                ui,
                                 "Buscar pastas",
                                 dark,
                                 self.icons.as_ref().and_then(|i| i.get("folder")).map(|t| {
@@ -1374,6 +1464,40 @@ clip={:?}
                             .clicked()
                             {
                                 self.browse_folders_into_playlist();
+                            }
+                            let find_w = (ui.available_width() * 0.42).clamp(120.0, 220.0);
+                            let te = ui.add(
+                                egui::TextEdit::singleline(&mut self.find_query)
+                                    .hint_text("Localizar…")
+                                    .desired_width(find_w)
+                                    .font(egui::TextStyle::Body),
+                            );
+                            if self.find_request_focus {
+                                te.request_focus();
+                                self.find_request_focus = false;
+                            }
+                            let te = te.on_hover_text("Filtra a playlist (Ctrl+F)");
+                            // Keep results in sync for any legacy callers.
+                            if te.changed() || !self.find_query.is_empty() {
+                                let q = self.find_query.to_lowercase();
+                                let eng = self.engine.lock();
+                                self.find_results = eng
+                                    .playlist
+                                    .items
+                                    .iter()
+                                    .enumerate()
+                                    .filter(|(_, it)| {
+                                        q.is_empty()
+                                            || it.label.to_lowercase().contains(&q)
+                                            || it
+                                                .path
+                                                .display()
+                                                .to_string()
+                                                .to_lowercase()
+                                                .contains(&q)
+                                    })
+                                    .map(|(i, _)| i)
+                                    .collect();
                             }
                         });
                     });
@@ -1431,11 +1555,24 @@ clip={:?}
                         } else {
                             None
                         };
+                        let q = self.find_query.trim().to_lowercase();
                         let rows: Vec<(usize, String, bool, bool, bool, String, bool)> = eng
                             .playlist
                             .items
                             .iter()
                             .enumerate()
+                            .filter(|(_, item)| {
+                                if q.is_empty() {
+                                    return true;
+                                }
+                                item.label.to_lowercase().contains(&q)
+                                    || item
+                                        .path
+                                        .display()
+                                        .to_string()
+                                        .to_lowercase()
+                                        .contains(&q)
+                            })
                             .map(|(i, item)| {
                                 let playing = is_playing_air && cursor == i;
                                 let selected = self.selection.contains(&i)
@@ -1467,13 +1604,23 @@ clip={:?}
                                         .icons
                                         .as_ref()
                                         .and_then(|i| i.image("library", 40.0));
-                                    empty_state(
-                                        ui,
-                                        dark,
-                                        icon,
-                                        "Arraste músicas aqui",
-                                        "Solte arquivos ou pastas, ou use Abrir lista (Ctrl+O).",
-                                    );
+                                    if !q.is_empty() {
+                                        empty_state(
+                                            ui,
+                                            dark,
+                                            icon,
+                                            "Nada encontrado",
+                                            "Limpe o filtro Localizar ou ajuste o termo.",
+                                        );
+                                    } else {
+                                        empty_state(
+                                            ui,
+                                            dark,
+                                            icon,
+                                            "Arraste músicas aqui",
+                                            "Solte arquivos ou pastas, ou use Abrir lista (Ctrl+O).",
+                                        );
+                                    }
                                 }
                                 for (i, name, playing, selected, is_next, dur, alt) in rows {
                                     let row_h = 30.0;
@@ -2398,18 +2545,30 @@ clip={:?}
             });
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                 let eng = self.engine.lock();
-                for e in &eng.sweepers.entries {
-                    ui.label(format!(
-                        "{} ← {} @ {:.1}s ({})",
-                        e.base_file.display(),
-                        e.sweeper_file.display(),
-                        e.offset_secs,
-                        if e.enabled { "on" } else { "off" }
-                    ));
+                if eng.sweepers.entries.is_empty() {
+                    let icon = self.icons.as_ref().and_then(|i| i.image("pulse", 40.0));
+                    empty_state(
+                        ui,
+                        dark,
+                        icon,
+                        "Nenhum sweeper cadastrado",
+                        "Escolha a base e o áudio de sweeper acima, defina o offset e clique em Adicionar. Também dá para importar .zsl ou sweepers.db.",
+                    );
+                } else {
+                    for e in &eng.sweepers.entries {
+                        ui.label(format!(
+                            "{} ← {} @ {:.1}s ({})",
+                            e.base_file.display(),
+                            e.sweeper_file.display(),
+                            e.offset_secs,
+                            if e.enabled { "on" } else { "off" }
+                        ));
+                    }
                 }
             });
         });
     }
+
 
     fn page_settings(&mut self, ui: &mut egui::Ui, dark: bool) {
         let avail = ui.available_size();
@@ -3099,30 +3258,15 @@ clip={:?}
     }
 
     fn win_find(&mut self, ctx: &egui::Context, dark: bool) {
-        let mut open = self.windows.find;
-        egui::Window::new("Localizar na lista")
-            .open(&mut open)
-            .frame(elevated_frame(dark))
-            .show(ctx, |ui| {
-                ui.text_edit_singleline(&mut self.find_query);
-                if ui.button("Buscar").clicked() {
-                    let eng = self.engine.lock();
-                    let q = self.find_query.to_lowercase();
-                    self.find_results = eng
-                        .playlist
-                        .items
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, it)| it.label.to_lowercase().contains(&q))
-                        .map(|(i, _)| i)
-                        .collect();
-                }
-                for i in &self.find_results {
-                    ui.label(format!("#{i}"));
-                }
-            });
-        self.windows.find = open;
+        // Localizar is inline in the playlist header — never cover No ar / VU.
+        let _ = (ctx, dark);
+        if self.windows.find {
+            self.windows.find = false;
+            self.find_request_focus = true;
+            self.nav = NavPage::Studio;
+        }
     }
+
 
     fn win_find_folders(&mut self, ctx: &egui::Context, dark: bool) {
         let mut open = self.windows.find_folders;
@@ -3844,7 +3988,7 @@ clip={:?}
         let mut resume = false;
         let mut ignore = false;
         egui::TopBottomPanel::top("session_resume_infobar")
-            .exact_height(36.0)
+            .exact_height(26.0)
             .frame(
                 egui::Frame::new()
                     .fill(if dark {
@@ -3852,21 +3996,31 @@ clip={:?}
                     } else {
                         Color32::from_rgb(0xE8, 0xF5, 0xE9)
                     })
-                    .inner_margin(egui::Margin::symmetric(12, 6)),
+                    .inner_margin(egui::Margin::symmetric(10, 2)),
             )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new(label).color(if dark {
-                        Color32::from_gray(230)
-                    } else {
-                        Color32::from_gray(30)
-                    }));
+                    ui.label(
+                        RichText::new(label)
+                            .size(12.5)
+                            .color(if dark {
+                                Color32::from_gray(230)
+                            } else {
+                                Color32::from_gray(30)
+                            }),
+                    );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("Ignorar").clicked() {
+                        if ui
+                            .add_sized([64.0, 20.0], egui::Button::new(RichText::new("Ignorar").size(12.0)))
+                            .clicked()
+                        {
                             ignore = true;
                         }
                         if ui
-                            .add(egui::Button::new("Retomar").fill(self.accent()))
+                            .add_sized(
+                                [72.0, 20.0],
+                                egui::Button::new(RichText::new("Retomar").size(12.0)).fill(self.accent()),
+                            )
                             .clicked()
                         {
                             resume = true;
@@ -3883,6 +4037,7 @@ clip={:?}
             }
         }
     }
+
 
     fn apply_session_resume(&mut self, snap: crate::session::SessionSnapshot) {
         let was_playing = snap.was_playing;
@@ -3955,9 +4110,29 @@ clip={:?}
                 ui.add(egui::Slider::new(&mut cue_in, 0.0..=cue_in_max).text("Cue in"));
                 let cue_out_min = cue_in.min(cue_out_max - 0.05);
                 ui.add(egui::Slider::new(&mut cue_out, cue_out_min..=cue_out_max).text("Cue out"));
-                ui.add(egui::Slider::new(&mut fade_in, 0.0..=8.0).text("Fade in"));
-                ui.add(egui::Slider::new(&mut fade_out, 0.0..=8.0).text("Fade out / crossfade"));
-                ui.add(egui::Slider::new(&mut overlap, 0.0..=15.0).text("Overlap"));
+                let playable = (cue_out - cue_in).max(0.1);
+                let fade_cap = playable.min(8.0);
+                let overlap_cap = playable.min(15.0);
+                ui.add(egui::Slider::new(&mut fade_in, 0.0..=fade_cap.max(0.1)).text("Fade in"));
+                ui.add(egui::Slider::new(&mut fade_out, 0.0..=fade_cap.max(0.1)).text("Fade out / crossfade"));
+                ui.add(egui::Slider::new(&mut overlap, 0.0..=overlap_cap.max(0.1)).text("Overlap"));
+                let mut warn: Option<String> = None;
+                if fade_in + fade_out > playable + 0.01 {
+                    let scale = playable / (fade_in + fade_out).max(0.01);
+                    fade_in *= scale;
+                    fade_out *= scale;
+                    warn = Some(format!(
+                        "Fade in+out limitado à duração no ar ({:.1}s).",
+                        playable
+                    ));
+                }
+                if overlap > playable + 0.01 {
+                    overlap = playable;
+                    warn = Some(format!(
+                        "Overlap limitado à duração no ar ({:.1}s).",
+                        playable
+                    ));
+                }
                 it.timing.cue_in = if cue_in > 0.01 { Some(cue_in) } else { None };
                 it.timing.cue_out = if file_dur.map(|d| (cue_out - d).abs() < 0.05).unwrap_or(false)
                     || cue_out <= cue_in
@@ -3987,6 +4162,13 @@ clip={:?}
                             .color(accent),
                     );
                 }
+                if let Some(w) = warn {
+                    ui.label(
+                        RichText::new(w)
+                            .font(typo::caption())
+                            .color(Color32::from_rgb(0xE8, 0xA8, 0x38)),
+                    );
+                }
             });
         self.windows.track_props = open;
         if !open {
@@ -4005,93 +4187,81 @@ clip={:?}
         }
     }
 
-    fn classic_menu_bar(&mut self, ctx: &egui::Context, dark: bool) {
-        let show = self.engine.lock().config.show_classic_menu;
-        if !show {
-            return;
-        }
-        egui::TopBottomPanel::top("classic_menu")
-            .exact_height(28.0)
-            .frame(
-                egui::Frame::new()
-                    .fill(mica_bg(dark))
-                    .inner_margin(egui::Margin::symmetric(8, 2)),
-            )
-            .show(ctx, |ui| {
-                egui::menu::bar(ui, |ui| {
-                    ui.menu_button("Arquivo", |ui| {
-                        if ui.button("Abrir lista…").clicked() {
-                            ui.close_menu();
-                            if let Some(path) = self.pick_filtered_file("lst", &["lst", "m3u", "m3u8", "pls"]) {
-                                let mut eng = self.engine.lock();
-                                if eng.playlist.load_list_file(&path).is_ok() {
-                                    eng.config.last_playlist = Some(path.clone());
-                                    let _ = eng.config.save();
-                                    eng.set_status(format!("Lista: {}", path.display()));
-                                }
-                            }
+    /// Menus clássicos compactos na mesma linha da title bar (sem segunda faixa).
+    /// Exibir não duplica a sidebar: só janelas flutuantes.
+    fn classic_menu_inline(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, dark: bool) {
+        let _ = dark;
+        egui::menu::bar(ui, |ui| {
+            ui.set_height(ui.available_height());
+            ui.menu_button("Arquivo", |ui| {
+                if ui.button("Abrir lista…").clicked() {
+                    ui.close_menu();
+                    if let Some(path) =
+                        self.pick_filtered_file("lst", &["lst", "m3u", "m3u8", "pls"])
+                    {
+                        let mut eng = self.engine.lock();
+                        if eng.playlist.load_list_file(&path).is_ok() {
+                            eng.config.last_playlist = Some(path.clone());
+                            let _ = eng.config.save();
+                            eng.set_status(format!("Lista: {}", path.display()));
                         }
-                        if ui.button("Salvar lista…").clicked() {
-                            ui.close_menu();
-                            if let Some(path) = self.save_filtered_file(
-                                "playlist.lst",
-                                Some(("Lista", &["lst", "m3u"])),
-                            ) {
-                                let mut eng = self.engine.lock();
-                                if eng.playlist.save_list_file(&path).is_ok() {
-                                    eng.playlist.source = Some(path.clone());
-                                    eng.set_status(format!("Lista salva: {}", path.display()));
-                                }
-                            }
+                    }
+                }
+                if ui.button("Salvar lista…").clicked() {
+                    ui.close_menu();
+                    if let Some(path) = self.save_filtered_file(
+                        "playlist.lst",
+                        Some(("Lista", &["lst", "m3u"])),
+                    ) {
+                        let mut eng = self.engine.lock();
+                        if eng.playlist.save_list_file(&path).is_ok() {
+                            eng.playlist.source = Some(path.clone());
+                            eng.set_status(format!("Lista salva: {}", path.display()));
                         }
-                        ui.separator();
-                        if ui.button("Sair").clicked() {
-                            ui.close_menu();
-                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                        }
-                    });
-                    ui.menu_button("Editar", |ui| {
-                        if ui.button("Localizar na lista…").clicked() {
-                            self.windows.find = true;
-                            ui.close_menu();
-                        }
-                        if ui.button("Cue / fade da seleção…").clicked() {
-                            self.track_edit_idx = self.selected;
-                            self.windows.track_props = true;
-                            ui.close_menu();
-                        }
-                    });
-                    ui.menu_button("Exibir", |ui| {
-                        if ui.button("Eventos").clicked() {
-                            self.nav = NavPage::Events;
-                            ui.close_menu();
-                        }
-                        if ui.button("Jingles").clicked() {
-                            self.nav = NavPage::Jingles;
-                            ui.close_menu();
-                        }
-                        if ui.button("Biblioteca").clicked() {
-                            self.nav = NavPage::Library;
-                            ui.close_menu();
-                        }
-                        if ui.button("Logs").clicked() {
-                            self.nav = NavPage::Logs;
-                            ui.close_menu();
-                        }
-                        if ui.button("Configurações").clicked() {
-                            self.nav = NavPage::Settings;
-                            ui.close_menu();
-                        }
-                    });
-                    ui.menu_button("Ajuda", |ui| {
-                        if ui.button("Sobre o OndaLivre").clicked() {
-                            self.windows.about = true;
-                            ui.close_menu();
-                        }
-                    });
-                });
+                    }
+                }
+                ui.separator();
+                if ui.button("Sair").clicked() {
+                    ui.close_menu();
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
             });
+            ui.menu_button("Editar", |ui| {
+                if ui.button("Localizar na lista…").clicked() {
+                    self.windows.find = false;
+                    self.find_request_focus = true;
+                    self.nav = NavPage::Studio;
+                    ui.close_menu();
+                }
+                if ui.button("Cue / fade da seleção…").clicked() {
+                    self.track_edit_idx = self.selected;
+                    self.windows.track_props = true;
+                    ui.close_menu();
+                }
+            });
+            ui.menu_button("Janelas", |ui| {
+                if ui.button("Cue / pré-escuta").clicked() {
+                    self.windows.cue = true;
+                    ui.close_menu();
+                }
+                if ui.button("Players auxiliares").clicked() {
+                    self.windows.aux = true;
+                    ui.close_menu();
+                }
+                if ui.button("No ar").clicked() {
+                    self.nav = NavPage::Studio;
+                    ui.close_menu();
+                }
+            });
+            ui.menu_button("Ajuda", |ui| {
+                if ui.button("Sobre o OndaLivre").clicked() {
+                    self.windows.about = true;
+                    ui.close_menu();
+                }
+            });
+        });
     }
+
 
 }
 
